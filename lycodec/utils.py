@@ -435,17 +435,18 @@ class ProductionAdaptiveBitAllocator(nn.Module):
             current_complexity = complexity[:, t:t+1]
             
             # Determine if we should borrow or lend bits
-            if current_complexity > 0.7:  # High complexity - may need extra bits
-                if self.bit_credit > 0:
-                    # Use banked bits
-                    extra_bits = min(self.bit_credit.item(), avg_allocation.item() * 0.2)
+            mean_complexity = current_complexity.mean().item()
+            if mean_complexity > 0.7:  # High complexity - may need extra bits
+                if self.bit_credit.item() > 0:
+                    extra_bits = min(self.bit_credit.item(), avg_allocation.mean().item() * 0.2)
                     banked_allocation[:, t:t+1] += extra_bits / self.target_bitrate
                     self.bit_credit.sub_(extra_bits)
-            
-            elif current_complexity < 0.3:  # Low complexity - bank excess bits
+
+            elif mean_complexity < 0.3:  # Low complexity - bank excess bits
                 excess_bits = (avg_allocation - current_allocation) * 0.5
-                bankable_bits = torch.clamp(excess_bits, 0, self.max_credit - self.bit_credit)
-                
+                max_deposit = self.max_credit - self.bit_credit.item()
+                bankable_bits = torch.clamp(excess_bits, 0.0, max_deposit)
+
                 banked_allocation[:, t:t+1] -= bankable_bits
                 self.bit_credit.add_(bankable_bits.sum().item())
         

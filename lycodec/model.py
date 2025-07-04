@@ -14,8 +14,7 @@ from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 import math
 
-from .psychoacoustic import PsychoacousticTransform, FastRMSNorm2D
-from .quantization import VectorizedQuantizer, ConsistencyAwareNoiseScheduler
+from .psychoacoustic import FastRMSNorm2D
 from .vocoder import DDSPVocoder
 from .utils import ProductionAdaptiveBitAllocator
 
@@ -144,6 +143,88 @@ class LowRankLinearFusion(nn.Module):
         return torch.sigmoid(self.residual_weight_logit).item()
 
 
+class Stride32Frontend(nn.Module):
+    """Stacked convolutional frontend with stride 32 reduction."""
+
+    def __init__(self, in_channels: int, hidden_dim: int):
+        super().__init__()
+        layers = []
+        dims = [hidden_dim // 4, hidden_dim // 2, hidden_dim // 2,
+                hidden_dim, hidden_dim]
+        prev = in_channels
+        for dim in dims:
+            layers.append(nn.Conv1d(prev, dim, kernel_size=3, stride=2, padding=1))
+            layers.append(nn.GELU())
+            prev = dim
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class BottleneckDown(nn.Module):
+    """Temporal and channel downsampling to create compact latents."""
+
+    def __init__(self, hidden_dim: int, factor: int = 10):
+        super().__init__()
+        self.factor = factor
+        reduced_dim = hidden_dim // factor
+        self.conv = nn.Conv1d(hidden_dim, reduced_dim, kernel_size=1, stride=factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, hidden_dim]
+        x = x.transpose(1, 2)
+        x = self.conv(x)
+        x = x.transpose(1, 2)
+        return x
+
+
+class BottleneckUp(nn.Module):
+    """Re-expand compact latents back to encoder dimensionality."""
+
+    def __init__(self, hidden_dim: int, factor: int = 10):
+        super().__init__()
+        self.factor = factor
+        reduced_dim = hidden_dim // factor
+        self.deconv = nn.ConvTranspose1d(reduced_dim, hidden_dim, kernel_size=1, stride=factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, hidden_dim // factor]
+        x = x.transpose(1, 2)
+        x = self.deconv(x)
+        x = x.transpose(1, 2)
+        return x
+
+
+class LinearAttention(nn.Module):
+    """Memory-efficient linear attention."""
+
+    def __init__(self, hidden_dim: int, num_heads: int = 8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.query = nn.Linear(hidden_dim, hidden_dim)
+        self.key = nn.Linear(hidden_dim, hidden_dim)
+        self.value = nn.Linear(hidden_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, t, h = x.shape
+        q = self.query(x).view(b, t, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.key(x).view(b, t, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.value(x).view(b, t, self.num_heads, self.head_dim).transpose(1, 2)
+
+        q = F.elu(q) + 1
+        k = F.elu(k) + 1
+
+        kv = torch.einsum('b h t d, b h t e -> b h d e', k, v)
+        z = 1.0 / (torch.einsum('b h t d, b h d -> b h t', q, k.sum(dim=2)) + 1e-6)
+        out = torch.einsum('b h t d, b h d e -> b h t e', q, kv)
+        out = out * z.unsqueeze(-1)
+        out = out.transpose(1, 2).contiguous().view(b, t, h)
+        return self.out_proj(out)
+
+
 class LyCodecTransformerLayer(nn.Module):
     """
     Enhanced transformer layer with psychoacoustic attention and low-rank fusion.
@@ -161,11 +242,10 @@ class LyCodecTransformerLayer(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_dim // self.num_heads
         
-        # Enhanced psychoacoustic attention with orthogonal initialization
-        self.psycho_attention = PsychoacousticTransform(
+        # Memory-efficient linear attention
+        self.self_attention = LinearAttention(
             hidden_dim=config.hidden_dim,
-            num_heads=config.num_attention_heads,
-            psycho_bands=config.psycho_bands
+            num_heads=config.num_attention_heads
         )
         
         # FastRMSNorm2D with cross-platform compatibility
@@ -208,9 +288,9 @@ class LyCodecTransformerLayer(nn.Module):
         Returns:
             Transformed tensor with same shape as input
         """
-        # Pre-norm psychoacoustic attention with residual connection
+        # Pre-norm linear attention with residual connection
         normed_x = self.attention_norm(x)
-        attn_output = self.psycho_attention(normed_x)
+        attn_output = self.self_attention(normed_x)
         x = x + attn_output
         
         # Cross-level feature fusion if applicable
@@ -240,18 +320,13 @@ class LyCodecEncoder(nn.Module):
         
         self.config = config
         
-        # Input projection for stereo audio
-        self.input_projection = nn.Conv1d(
-            in_channels=config.channels,
-            out_channels=config.hidden_dim,
-            kernel_size=7,
-            stride=2,
-            padding=3
-        )
+        # Stride-32 convolutional frontend
+        self.frontend = Stride32Frontend(config.channels, config.hidden_dim)
         
         # Positional encoding for temporal modeling
+        seq_len = math.ceil(config.segment_samples / 32)
         self.pos_encoding = nn.Parameter(
-            torch.randn(1, config.segment_samples // 2, config.hidden_dim) * 0.02
+            torch.randn(1, seq_len, config.hidden_dim) * 0.02
         )
         
         # Transformer layers with cross-level fusion
@@ -288,10 +363,14 @@ class LyCodecEncoder(nn.Module):
         """
         batch_size = audio.shape[0]
         
-        # Input projection and positional encoding
-        x = self.input_projection(audio)  # [batch, hidden_dim, seq_len]
-        x = x.transpose(1, 2)  # [batch, seq_len, hidden_dim]
-        x = x + self.pos_encoding
+        # Frontend and positional encoding
+        x = self.frontend(audio)  # [batch, hidden_dim, seq_len]
+        x = x.transpose(1, 2)
+        if x.shape[1] <= self.pos_encoding.shape[1]:
+            pos = self.pos_encoding[:, :x.shape[1]]
+        else:
+            pos = F.interpolate(self.pos_encoding.transpose(1, 2), size=x.shape[1], mode='linear', align_corners=False).transpose(1, 2)
+        x = x + pos
         
         # Store intermediate features for cross-level fusion
         layer_features = []
@@ -404,18 +483,9 @@ class LyCodecModel(nn.Module):
         
         # Core model components
         self.encoder = LyCodecEncoder(config)
-        self.quantizer = VectorizedQuantizer(
-            hidden_dim=config.hidden_dim,
-            codebook_size=config.codebook_size,
-            commitment_cost=config.commitment_cost,
-            ema_decay=config.ema_decay
-        )
+        self.bottleneck_down = BottleneckDown(config.hidden_dim, factor=10)
+        self.bottleneck_up = BottleneckUp(config.hidden_dim, factor=10)
         self.decoder = LyCodecDecoder(config)
-        
-        # Consistency-aware noise scheduler for training
-        self.noise_scheduler = ConsistencyAwareNoiseScheduler(
-            hidden_dim=config.hidden_dim
-        )
         
         # Initialize model parameters
         self._initialize_parameters()
@@ -444,29 +514,20 @@ class LyCodecModel(nn.Module):
             Dictionary containing reconstructed audio and losses
         """
         # Encode to latent features
-        latent_features, encoder_metadata = self.encoder(audio)
-        
-        # Apply noise scheduling during training
-        if training:
-            latent_features = self.noise_scheduler(latent_features)
-        
-        # Vectorized quantization
-        quantized_features, quantization_loss, quantizer_metadata = self.quantizer(
-            latent_features, training=training
-        )
-        
-        # Combine metadata
-        decoder_metadata = {**encoder_metadata, **quantizer_metadata}
-        
+        latent_big, metadata = self.encoder(audio)
+
+        # Bottleneck compression and expansion
+        latent_small = self.bottleneck_down(latent_big)
+        latent_recon = self.bottleneck_up(latent_small)
+
         # Decode to audio
-        reconstructed_audio = self.decoder(quantized_features, decoder_metadata)
-        
+        reconstructed_audio = self.decoder(latent_recon, metadata)
+
         return {
             'reconstructed_audio': reconstructed_audio,
-            'quantization_loss': quantization_loss,
-            'latent_features': latent_features,
-            'quantized_features': quantized_features,
-            'metadata': decoder_metadata
+            'latent_features': latent_big,
+            'bottleneck_latent': latent_small,
+            'metadata': metadata
         }
     
     def encode(self, audio: torch.Tensor, bitrate: int = 192) -> bytes:
@@ -482,15 +543,10 @@ class LyCodecModel(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            # Set target bitrate in bit allocator
             self.encoder.bit_allocator.set_target_bitrate(bitrate)
-            
-            # Encode to quantized features
-            latent_features, metadata = self.encoder(audio)
-            quantized_features, _, _ = self.quantizer(latent_features, training=False)
-            
-            # Compress to bitstream (simplified implementation)
-            bitstream = self._compress_to_bitstream(quantized_features, metadata)
+            latent_big, metadata = self.encoder(audio)
+            latent_small = self.bottleneck_down(latent_big)
+            bitstream = self._compress_to_bitstream(latent_small, metadata)
             
         return bitstream
     
@@ -506,11 +562,9 @@ class LyCodecModel(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            # Decompress bitstream (simplified implementation)
-            quantized_features, metadata = self._decompress_from_bitstream(bitstream)
-            
-            # Decode to audio
-            audio = self.decoder(quantized_features, metadata)
+            latent_small, metadata = self._decompress_from_bitstream(bitstream)
+            latent_big = self.bottleneck_up(latent_small)
+            audio = self.decoder(latent_big, metadata)
             
         return audio
     
