@@ -169,8 +169,8 @@ class LyCodecLoss(nn.Module):
     """
     Comprehensive loss function for LyCodec training.
     
-    Combines reconstruction loss, quantization loss, perceptual loss,
-    and bit allocation efficiency for high-quality codec optimization.
+    Combines reconstruction loss, perceptual loss, and bit allocation
+    efficiency for high-quality codec optimization.
     """
     
     def __init__(self, config: Dict):
@@ -178,7 +178,6 @@ class LyCodecLoss(nn.Module):
         
         # Loss weights from config
         self.reconstruction_weight = config.get('reconstruction_weight', 1.0)
-        self.quantization_weight = config.get('quantization_weight', 0.0)
         self.perceptual_weight = config.get('perceptual_weight', 0.1)
         self.bitrate_weight = config.get('bitrate_weight', 0.01)
         
@@ -279,13 +278,10 @@ class LyCodecLoss(nn.Module):
             Dictionary of loss components and total loss
         """
         reconstructed_audio = model_output['reconstructed_audio']
-        quantization_loss = model_output.get(
-            'quantization_loss', torch.tensor(0.0, device=reconstructed_audio.device)
-        )
         metadata = model_output.get('metadata', {})
         
         # 1. Reconstruction loss (time domain)
-        reconstruction_loss = F.mse_loss(reconstructed_audio, target_audio)
+        reconstruction_loss = F.l1_loss(reconstructed_audio, target_audio)
         
         # 2. Perceptual loss (frequency domain)
         perceptual_loss = self._compute_perceptual_loss(reconstructed_audio, target_audio)
@@ -296,7 +292,6 @@ class LyCodecLoss(nn.Module):
         # 4. Total loss
         total_loss = (
             self.reconstruction_weight * reconstruction_loss +
-            self.quantization_weight * quantization_loss +
             self.perceptual_weight * perceptual_loss +
             self.bitrate_weight * bitrate_loss
         )
@@ -304,7 +299,6 @@ class LyCodecLoss(nn.Module):
         return {
             'total_loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
-            'quantization_loss': quantization_loss,
             'perceptual_loss': perceptual_loss,
             'bitrate_loss': bitrate_loss
         }
@@ -524,7 +518,6 @@ class LyCodecTrainer:
         step_stats = {
             'total_loss': total_loss.item(),
             'reconstruction_loss': loss_dict['reconstruction_loss'].item(),
-            'quantization_loss': loss_dict['quantization_loss'].item(),
             'perceptual_loss': loss_dict['perceptual_loss'].item(),
             'bitrate_loss': loss_dict['bitrate_loss'].item(),
             'learning_rate': self.scheduler.get_last_lr()[0],

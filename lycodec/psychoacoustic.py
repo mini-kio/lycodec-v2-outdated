@@ -579,8 +579,9 @@ class PsychoacousticTransform(nn.Module):
     and cross-channel correlation optimization for production-grade audio modeling.
     """
     
-    def __init__(self, hidden_dim: int, num_heads: int = 8, 
-                 psycho_bands: int = 64, sample_rate: int = 44100):
+    def __init__(self, hidden_dim: int, num_heads: int = 8,
+                 psycho_bands: int = 64, sample_rate: int = 44100,
+                 use_linear_attention: bool = True):
         super().__init__()
         
         self.hidden_dim = hidden_dim
@@ -588,6 +589,7 @@ class PsychoacousticTransform(nn.Module):
         self.head_dim = hidden_dim // num_heads
         self.psycho_bands = psycho_bands
         self.sample_rate = sample_rate
+        self.use_linear_attention = use_linear_attention
         
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         
@@ -740,28 +742,41 @@ class PsychoacousticTransform(nn.Module):
         keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
         
-        # Scaled dot-product attention
-        attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        
         # Psychoacoustic masking modulation
         masking_curve = self._compute_psychoacoustic_masking(x)
-        
-        # Apply masking to attention scores (reshape for broadcasting)
-        if masking_curve.shape[-1] == self.psycho_bands:
-            # Interpolate masking curve to match attention dimensions
-            masking_resized = F.interpolate(
-                masking_curve.transpose(1, 2).unsqueeze(1),  # [batch, 1, psycho_bands, seq_len]
-                size=(self.num_heads, seq_len),
-                mode='bilinear',
-                align_corners=False
-            ).squeeze(2)  # [batch, num_heads, seq_len]
-            
-            # Apply masking bias
-            attention_scores = attention_scores + masking_resized.unsqueeze(-1) * 0.1
-        
-        # Attention weights and values
-        attention_weights = F.softmax(attention_scores, dim=-1)
-        attended_values = torch.matmul(attention_weights, values)
+
+        if self.use_linear_attention:
+            q = F.elu(queries) + 1
+            k = F.elu(keys) + 1
+
+            if masking_curve.shape[-1] == self.psycho_bands:
+                masking_resized = F.interpolate(
+                    masking_curve.transpose(1, 2).unsqueeze(1),
+                    size=(self.num_heads, seq_len),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(2)
+                q = q * (1 + masking_resized.unsqueeze(-1) * 0.1)
+
+            kv = torch.einsum('bhnd,bhne->bhde', k, values)
+            z = 1 / (torch.einsum('bhnd,bhd->bhn', q, k.sum(dim=2)) + 1e-6)
+            attended_values = torch.einsum('bhnd,bhde->bhne', q, kv)
+            attended_values = attended_values * z.unsqueeze(-1)
+        else:
+            # Scaled dot-product attention
+            attention_scores = torch.matmul(queries, keys.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+            if masking_curve.shape[-1] == self.psycho_bands:
+                masking_resized = F.interpolate(
+                    masking_curve.transpose(1, 2).unsqueeze(1),
+                    size=(self.num_heads, seq_len),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(2)
+                attention_scores = attention_scores + masking_resized.unsqueeze(-1) * 0.1
+
+            attention_weights = F.softmax(attention_scores, dim=-1)
+            attended_values = torch.matmul(attention_weights, values)
         
         # Reshape and project output
         attended_values = attended_values.transpose(1, 2).contiguous().view(
