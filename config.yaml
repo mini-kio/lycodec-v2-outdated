@@ -13,17 +13,16 @@ model:
   num_layers: 8
   num_attention_heads: 8
   feedforward_dim: 2048
+
+  # Frontend configuration
+  frontend_stride: 32
+  frontend_kernel_size: 64
   
   # Psychoacoustic transform settings
   psycho_bands: 64
   psycho_window_size: 2048
   psycho_hop_length: 512
   
-  # Quantization configuration
-  quantization_bits: 8
-  codebook_size: 1024
-  commitment_cost: 0.25
-  ema_decay: 0.99
   
   # Low-rank fusion parameters
   low_rank_dim: 64
@@ -99,8 +98,7 @@ training:
 
 # Loss function weights
 loss:
-  reconstruction_weight: 1.0    # Time-domain MSE loss
-  quantization_weight: 0.25     # Vector quantization loss
+  reconstruction_weight: 1.0    # Time-domain L1 loss
   perceptual_weight: 0.1        # Multi-scale STFT loss
   bitrate_weight: 0.01          # Bitrate efficiency regularization
 
@@ -135,7 +133,6 @@ monitoring:
   track_metrics:
     - "total_loss"
     - "reconstruction_loss"
-    - "quantization_loss"
     - "perceptual_loss"
     - "bitrate_loss"
     - "current_bitrate"
@@ -177,10 +174,6 @@ hardware:
 
 # Experimental features
 experimental:
-  # Advanced quantization techniques
-  asymmetric_quantization: false
-  dynamic_quantization: false
-  
   # Attention optimizations
   flash_attention: false     # Enable if flash-attn available
   memory_efficient_attention: true

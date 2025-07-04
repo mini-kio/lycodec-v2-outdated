@@ -2,9 +2,9 @@
 LyCodec v2.1 Main Model Architecture
 ===================================
 
-Production-ready audio codec architecture with enhanced psychoacoustic modeling,
-vectorized quantization, and DDSP vocoder synthesis. Optimized for 44.1kHz stereo
-with ~45M parameters targeting V100×4 16GB training and <8GB inference.
+Production-ready audio codec architecture with enhanced psychoacoustic modeling
+and DDSP vocoder synthesis. Optimized for 44.1kHz stereo with ~45M parameters
+targeting V100×4 16GB training and <8GB inference.
 """
 
 import torch
@@ -44,11 +44,10 @@ class LyCodecConfig:
     psycho_window_size: int = 2048
     psycho_hop_length: int = 512
     
-    # Quantization configuration
-    quantization_bits: int = 8
-    codebook_size: int = 1024
-    commitment_cost: float = 0.25
-    ema_decay: float = 0.99
+
+    # Frontend configuration
+    frontend_stride: int = 32
+    frontend_kernel_size: int = 64
     
     # Low-rank fusion parameters
     low_rank_dim: int = 64
@@ -198,7 +197,8 @@ class LyCodecTransformerLayer(nn.Module):
         self.psycho_attention = PsychoacousticTransform(
             hidden_dim=config.hidden_dim,
             num_heads=config.num_attention_heads,
-            psycho_bands=config.psycho_bands
+            psycho_bands=config.psycho_bands,
+            use_linear_attention=True
         )
         
         # FastRMSNorm2D with cross-platform compatibility
@@ -273,18 +273,19 @@ class LyCodecEncoder(nn.Module):
         
         self.config = config
         
-        # Input projection for stereo audio
-        self.input_projection = nn.Conv1d(
+        # Stride-32 frontend
+        self.frontend = nn.Conv1d(
             in_channels=config.channels,
             out_channels=config.hidden_dim,
-            kernel_size=7,
-            stride=2,
-            padding=3
+            kernel_size=config.frontend_kernel_size,
+            stride=config.frontend_stride,
+            padding=config.frontend_kernel_size // 2
         )
         
         # Positional encoding for temporal modeling
+        frontend_len = math.ceil(config.segment_samples / config.frontend_stride)
         self.pos_encoding = nn.Parameter(
-            torch.randn(1, config.segment_samples // 2, config.hidden_dim) * 0.02
+            torch.randn(1, frontend_len, config.hidden_dim) * 0.02
         )
         
         # Transformer layers with cross-level fusion
@@ -321,8 +322,8 @@ class LyCodecEncoder(nn.Module):
         """
         batch_size = audio.shape[0]
         
-        # Input projection and positional encoding
-        x = self.input_projection(audio)  # [batch, hidden_dim, seq_len]
+        # Frontend and positional encoding
+        x = self.frontend(audio)  # [batch, hidden_dim, seq_len]
         x = x.transpose(1, 2)  # [batch, seq_len, hidden_dim]
         x = x + self.pos_encoding
         
@@ -426,7 +427,7 @@ class LyCodecModel(nn.Module):
     """
     Complete LyCodec v2.1 model for production audio compression.
     
-    Integrates encoder, vectorized quantization, and decoder with DDSP vocoder
+    Integrates encoder, continuous bottleneck, and decoder with DDSP vocoder
     for high-quality 44.1kHz stereo audio compression at adaptive bitrates.
     """
     
