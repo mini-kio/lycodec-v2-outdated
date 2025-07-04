@@ -178,7 +178,7 @@ class LyCodecLoss(nn.Module):
         
         # Loss weights from config
         self.reconstruction_weight = config.get('reconstruction_weight', 1.0)
-        self.quantization_weight = config.get('quantization_weight', 0.25)
+        self.quantization_weight = config.get('quantization_weight', 0.0)
         self.perceptual_weight = config.get('perceptual_weight', 0.1)
         self.bitrate_weight = config.get('bitrate_weight', 0.01)
         
@@ -279,7 +279,9 @@ class LyCodecLoss(nn.Module):
             Dictionary of loss components and total loss
         """
         reconstructed_audio = model_output['reconstructed_audio']
-        quantization_loss = model_output['quantization_loss']
+        quantization_loss = model_output.get(
+            'quantization_loss', torch.tensor(0.0, device=reconstructed_audio.device)
+        )
         metadata = model_output.get('metadata', {})
         
         # 1. Reconstruction loss (time domain)

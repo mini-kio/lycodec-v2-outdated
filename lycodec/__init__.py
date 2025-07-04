@@ -11,7 +11,6 @@ __author__ = "LyCodec Team"
 
 import torch
 from .model import LyCodecModel, LyCodecConfig
-from .quantization import VectorizedQuantizer, ConsistencyAwareNoiseScheduler
 from .psychoacoustic import PsychoacousticTransform, FastRMSNorm2D
 from .vocoder import DDSPVocoder, HarmonicSynthesizer
 from .utils import (
@@ -89,7 +88,6 @@ __all__ = [
     # Core model
     "LyCodecModel", "LyCodecConfig",
     # Components
-    "VectorizedQuantizer", "ConsistencyAwareNoiseScheduler",
     "PsychoacousticTransform", "FastRMSNorm2D",
     "DDSPVocoder", "HarmonicSynthesizer",
     # Utilities

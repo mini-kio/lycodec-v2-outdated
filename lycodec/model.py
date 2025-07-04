@@ -15,7 +15,6 @@ from dataclasses import dataclass
 import math
 
 from .psychoacoustic import PsychoacousticTransform, FastRMSNorm2D
-from .quantization import VectorizedQuantizer, ConsistencyAwareNoiseScheduler
 from .vocoder import DDSPVocoder
 from .utils import ProductionAdaptiveBitAllocator
 
@@ -142,6 +141,40 @@ class LowRankLinearFusion(nn.Module):
     def effective_residual_weight(self) -> float:
         """Get current effective residual weight."""
         return torch.sigmoid(self.residual_weight_logit).item()
+
+
+class BottleneckDown(nn.Module):
+    """Temporal and channel downsampling to create compact latents."""
+
+    def __init__(self, hidden_dim: int, factor: int = 10):
+        super().__init__()
+        self.factor = factor
+        reduced_dim = hidden_dim // factor
+        self.conv = nn.Conv1d(hidden_dim, reduced_dim, kernel_size=1, stride=factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, hidden_dim]
+        x = x.transpose(1, 2)
+        x = self.conv(x)
+        x = x.transpose(1, 2)
+        return x
+
+
+class BottleneckUp(nn.Module):
+    """Re-expand compact latents back to encoder dimensionality."""
+
+    def __init__(self, hidden_dim: int, factor: int = 10):
+        super().__init__()
+        self.factor = factor
+        reduced_dim = hidden_dim // factor
+        self.deconv = nn.ConvTranspose1d(reduced_dim, hidden_dim, kernel_size=1, stride=factor)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, hidden_dim // factor]
+        x = x.transpose(1, 2)
+        x = self.deconv(x)
+        x = x.transpose(1, 2)
+        return x
 
 
 class LyCodecTransformerLayer(nn.Module):
@@ -404,18 +437,9 @@ class LyCodecModel(nn.Module):
         
         # Core model components
         self.encoder = LyCodecEncoder(config)
-        self.quantizer = VectorizedQuantizer(
-            hidden_dim=config.hidden_dim,
-            codebook_size=config.codebook_size,
-            commitment_cost=config.commitment_cost,
-            ema_decay=config.ema_decay
-        )
+        self.bottleneck_down = BottleneckDown(config.hidden_dim, factor=10)
+        self.bottleneck_up = BottleneckUp(config.hidden_dim, factor=10)
         self.decoder = LyCodecDecoder(config)
-        
-        # Consistency-aware noise scheduler for training
-        self.noise_scheduler = ConsistencyAwareNoiseScheduler(
-            hidden_dim=config.hidden_dim
-        )
         
         # Initialize model parameters
         self._initialize_parameters()
@@ -444,29 +468,20 @@ class LyCodecModel(nn.Module):
             Dictionary containing reconstructed audio and losses
         """
         # Encode to latent features
-        latent_features, encoder_metadata = self.encoder(audio)
-        
-        # Apply noise scheduling during training
-        if training:
-            latent_features = self.noise_scheduler(latent_features)
-        
-        # Vectorized quantization
-        quantized_features, quantization_loss, quantizer_metadata = self.quantizer(
-            latent_features, training=training
-        )
-        
-        # Combine metadata
-        decoder_metadata = {**encoder_metadata, **quantizer_metadata}
-        
+        latent_big, metadata = self.encoder(audio)
+
+        # Bottleneck compression and expansion
+        latent_small = self.bottleneck_down(latent_big)
+        latent_recon = self.bottleneck_up(latent_small)
+
         # Decode to audio
-        reconstructed_audio = self.decoder(quantized_features, decoder_metadata)
-        
+        reconstructed_audio = self.decoder(latent_recon, metadata)
+
         return {
             'reconstructed_audio': reconstructed_audio,
-            'quantization_loss': quantization_loss,
-            'latent_features': latent_features,
-            'quantized_features': quantized_features,
-            'metadata': decoder_metadata
+            'latent_features': latent_big,
+            'bottleneck_latent': latent_small,
+            'metadata': metadata
         }
     
     def encode(self, audio: torch.Tensor, bitrate: int = 192) -> bytes:
@@ -482,15 +497,10 @@ class LyCodecModel(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            # Set target bitrate in bit allocator
             self.encoder.bit_allocator.set_target_bitrate(bitrate)
-            
-            # Encode to quantized features
-            latent_features, metadata = self.encoder(audio)
-            quantized_features, _, _ = self.quantizer(latent_features, training=False)
-            
-            # Compress to bitstream (simplified implementation)
-            bitstream = self._compress_to_bitstream(quantized_features, metadata)
+            latent_big, metadata = self.encoder(audio)
+            latent_small = self.bottleneck_down(latent_big)
+            bitstream = self._compress_to_bitstream(latent_small, metadata)
             
         return bitstream
     
@@ -506,11 +516,9 @@ class LyCodecModel(nn.Module):
         """
         self.eval()
         with torch.no_grad():
-            # Decompress bitstream (simplified implementation)
-            quantized_features, metadata = self._decompress_from_bitstream(bitstream)
-            
-            # Decode to audio
-            audio = self.decoder(quantized_features, metadata)
+            latent_small, metadata = self._decompress_from_bitstream(bitstream)
+            latent_big = self.bottleneck_up(latent_small)
+            audio = self.decoder(latent_big, metadata)
             
         return audio
     

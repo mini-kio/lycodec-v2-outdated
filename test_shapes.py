@@ -131,23 +131,20 @@ def test_encoder_decoder_shapes():
         with torch.no_grad():
             # Encoder 테스트
             print("\n1. Encoder 테스트...")
-            latent_features, encoder_metadata = model.encoder(audio_input)
-            print(f"  Latent features: {latent_features.shape}")
+            latent_big, encoder_metadata = model.encoder(audio_input)
+            print(f"  Latent features: {latent_big.shape}")
             print(f"  Encoder metadata keys: {list(encoder_metadata.keys())}")
-            
-            # Quantizer 테스트
-            print("\n2. Quantizer 테스트...")
-            quantized_features, quant_loss, quant_metadata = model.quantizer(
-                latent_features, training=False
-            )
-            print(f"  Quantized features: {quantized_features.shape}")
-            print(f"  Quantization loss: {quant_loss.item():.6f}")
-            print(f"  Quantizer metadata keys: {list(quant_metadata.keys())}")
-            
+
+            # Bottleneck 테스트
+            print("\n2. Bottleneck 테스트...")
+            latent_small = model.bottleneck_down(latent_big)
+            print(f"  Latent small: {latent_small.shape}")
+            latent_recon = model.bottleneck_up(latent_small)
+            print(f"  Latent recon: {latent_recon.shape}")
+
             # Decoder 테스트
             print("\n3. Decoder 테스트...")
-            decoder_metadata = {**encoder_metadata, **quant_metadata}
-            reconstructed = model.decoder(quantized_features, decoder_metadata)
+            reconstructed = model.decoder(latent_recon, encoder_metadata)
             print(f"  Reconstructed audio: {reconstructed.shape}")
             
             # Shape 검증
