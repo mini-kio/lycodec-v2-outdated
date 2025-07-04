@@ -1,0 +1,283 @@
+# LyCodec v2.1 Production Configuration
+# =====================================
+# Optimized for V100×4 16GB training with 44.1kHz stereo audio
+# Target: ~45M parameters, <8GB inference memory, RTF 0.55 training
+
+# Random seed for reproducibility
+seed: 42
+
+# Model architecture configuration
+model:
+  # Core dimensions (optimized for V100×4 16GB)
+  hidden_dim: 512
+  num_layers: 8
+  num_attention_heads: 8
+  feedforward_dim: 2048
+  
+  # Psychoacoustic transform settings
+  psycho_bands: 64
+  psycho_window_size: 2048
+  psycho_hop_length: 512
+  
+  # Quantization configuration
+  quantization_bits: 8
+  codebook_size: 1024
+  commitment_cost: 0.25
+  ema_decay: 0.99
+  
+  # Low-rank fusion parameters
+  low_rank_dim: 64
+  fusion_layers: [2, 4, 6]  # Cross-level fusion points
+  residual_weight_init: 0.1
+  
+  # DDSP vocoder configuration
+  harmonics_count: 48      # Nyquist compliant up to 458Hz fundamental
+  noise_bands: 8           # Critical band decomposition
+  vocoder_hidden_dim: 256
+  
+  # Bit allocation parameters
+  min_bitrate: 128         # kbps
+  max_bitrate: 320         # kbps
+  target_bitrate: 192      # kbps default
+  complexity_lookahead: 16
+  safety_factor: 1.2
+
+# Audio data configuration
+data:
+  # Data paths
+  train_dir: "dataset/raw/music"
+  val_dir: "dataset/raw/music"  # Use same dir with different split
+  
+  # Audio processing parameters
+  sample_rate: 44100
+  channels: 2
+  segment_length: 5.0      # seconds
+  segments_per_track: 3    # non-overlapping segments per audio file
+  
+  # Data loading optimization
+  batch_size: 8            # Optimized for V100 16GB memory
+  num_workers: 4           # CPU workers for data loading
+  cache_size: 1000         # Number of audio files to cache in memory
+  
+  # Augmentation settings
+  augment: true
+  augmentation_prob: 0.3
+
+# Training configuration
+training:
+  # Training duration
+  num_epochs: 100
+  
+  # Optimization settings
+  optimizer:
+    type: "adamw"
+    learning_rate: 3e-4
+    betas: [0.9, 0.999]
+    weight_decay: 0.01
+    eps: 1e-8
+  
+  # Learning rate scheduling
+  scheduler:
+    type: "cosine_annealing"
+    T_max: 50000           # Steps for cosine cycle
+    eta_min: 1e-6
+  
+  # Memory optimization for V100×4 16GB
+  gradient_checkpointing: true
+  mixed_precision: true
+  
+  # Gradient clipping (adaptive P95 percentile)
+  gradient_clip_window: 100
+  gradient_clip_percentile: 95.0
+  
+  # Checkpointing and logging
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  checkpoint_interval: 1000   # steps
+  log_interval: 50           # steps
+  max_checkpoints: 5
+
+# Loss function weights
+loss:
+  reconstruction_weight: 1.0    # Time-domain MSE loss
+  quantization_weight: 0.25     # Vector quantization loss
+  perceptual_weight: 0.1        # Multi-scale STFT loss
+  bitrate_weight: 0.01          # Bitrate efficiency regularization
+
+# Production deployment settings
+deployment:
+  # Inference optimization
+  inference_batch_size: 1
+  max_sequence_length: 220500   # 5 seconds at 44.1kHz
+  
+  # Triton kernel settings
+  triton_enabled: true
+  fallback_mode: "pytorch"     # Fallback when Triton unavailable
+  
+  # Real-time factors (RTF)
+  target_rtf_server: 0.55      # Server deployment target
+  target_rtf_mobile: 1.15      # Mobile deployment target
+  
+  # Memory constraints
+  inference_memory_limit_gb: 8  # Target memory usage
+  
+  # Quality settings
+  default_bitrate: 192         # kbps
+  quality_presets:
+    low: 128                   # kbps
+    medium: 192               # kbps  
+    high: 256                 # kbps
+    lossless: 320             # kbps
+
+# Monitoring and validation
+monitoring:
+  # Metrics to track
+  track_metrics:
+    - "total_loss"
+    - "reconstruction_loss"
+    - "quantization_loss"
+    - "perceptual_loss"
+    - "bitrate_loss"
+    - "current_bitrate"
+    - "overflow_rate"
+    - "memory_utilization"
+    - "grad_norm"
+  
+  # Validation settings
+  validation_interval: 1000    # steps
+  validation_samples: 100     # number of validation samples
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    patience: 10              # epochs
+    min_delta: 1e-4          # minimum improvement threshold
+  
+  # Performance benchmarking
+  benchmark_interval: 5000     # steps
+  rtf_measurement_samples: 50
+
+# Hardware-specific optimizations
+hardware:
+  # V100 specific settings
+  gpu_memory_limit: 16        # GB per GPU
+  target_gpu_utilization: 0.85  # 85% memory utilization target
+  
+  # Multi-GPU training
+  distributed_backend: "nccl"
+  sync_bn: true              # Synchronized batch normalization
+  
+  # CUDA optimization
+  cuda_benchmark: true       # Enable cudnn benchmark for consistent input sizes
+  deterministic: false       # Set to true for reproducible results (slower)
+  
+  # Memory management
+  empty_cache_interval: 1000  # Clear CUDA cache every N steps
+  max_split_size_mb: 512     # CUDA memory allocator setting
+
+# Experimental features
+experimental:
+  # Advanced quantization techniques
+  asymmetric_quantization: false
+  dynamic_quantization: false
+  
+  # Attention optimizations
+  flash_attention: false     # Enable if flash-attn available
+  memory_efficient_attention: true
+  
+  # Advanced training techniques
+  gradient_accumulation_steps: 1
+  warmup_steps: 1000
+  cosine_restarts: false
+  
+  # Model compression
+  knowledge_distillation: false
+  pruning_enabled: false
+
+# Debugging and development
+debug:
+  # Debug modes
+  debug_mode: false
+  profile_training: false
+  
+  # Logging levels
+  log_level: "INFO"         # DEBUG, INFO, WARNING, ERROR
+  verbose_logging: false
+  
+  # Development helpers
+  fast_dev_run: false       # Run only few batches for testing
+  overfit_single_batch: false
+  
+  # Memory debugging
+  detect_anomaly: false     # PyTorch anomaly detection
+  memory_profiling: false
+  
+  # Model analysis
+  analyze_gradients: false
+  save_activations: false
+
+# Audio quality validation
+validation:
+  # Objective metrics
+  compute_pesq: false        # Perceptual evaluation (requires pesq package)
+  compute_stoi: false        # Short-time objective intelligibility
+  compute_mel_distance: true # Mel-spectrogram distance
+  
+  # Subjective quality targets
+  target_mos: 4.5           # Mean opinion score target
+  target_bitrate_efficiency: 0.8  # Bits per sample efficiency
+  
+  # Validation audio samples
+  reference_tracks:
+    - "reference_orchestral.wav"
+    - "reference_electronic.wav"
+    - "reference_vocal.wav"
+    - "reference_speech.wav"
+  
+  # Test conditions
+  test_bitrates: [128, 192, 256, 320]
+  test_segment_lengths: [5.0, 10.0, 30.0]  # seconds
+
+# Production deployment checklist
+production_ready:
+  # Model requirements
+  max_model_size_mb: 200    # Model file size limit
+  max_inference_memory_gb: 8
+  min_quality_mos: 4.0
+  
+  # Performance requirements  
+  max_inference_rtf: 1.0    # Real-time factor
+  max_encoding_latency_ms: 100
+  max_decoding_latency_ms: 50
+  
+  # Stability requirements
+  max_gradient_explosion_rate: 0.01  # 1% tolerance
+  max_checkpoint_corruption_rate: 0.001
+  min_convergence_stability: 0.95
+  
+  # Compatibility requirements
+  min_pytorch_version: "1.12.0"
+  supported_cuda_versions: ["11.8", "12.0", "12.1"]
+  fallback_cpu_support: true
+
+# Paths and directories
+paths:
+  # Data directories
+  dataset_root: "dataset"
+  raw_audio_dir: "dataset/raw/music"
+  processed_audio_dir: "dataset/processed"
+  
+  # Output directories
+  model_output_dir: "models"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  tensorboard_dir: "logs/tensorboard"
+  
+  # Temporary directories
+  temp_dir: "/tmp/lycodec"
+  cache_dir: "cache"
+  
+  # Export directories
+  export_dir: "exports"
+  onnx_dir: "exports/onnx"
+  torchscript_dir: "exports/torchscript"

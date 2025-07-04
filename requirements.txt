@@ -1,0 +1,89 @@
+# LyCodec v2.1 Requirements
+# =========================
+# Production-ready audio codec dependencies optimized for V100×4 16GB training
+
+# Core PyTorch ecosystem
+torch>=1.12.0,<3.0.0
+torchaudio>=0.12.0,<3.0.0
+torchvision>=0.13.0,<1.0.0
+
+# High-performance compute kernels
+triton>=2.0.0,<3.0.0          # Triton GPU kernels for harmonic synthesis
+flash-attn>=2.0.0,<3.0.0      # Flash attention optimization (optional)
+
+# Audio processing
+librosa>=0.9.0,<1.0.0         # Audio analysis and processing
+soundfile>=0.12.0,<1.0.0      # Audio file I/O
+resampy>=0.3.0,<1.0.0         # High-quality audio resampling
+
+# Scientific computing
+numpy>=1.21.0,<2.0.0
+scipy>=1.7.0,<2.0.0
+
+# Training and monitoring
+tensorboard>=2.8.0,<3.0.0     # Training visualization
+tqdm>=4.64.0,<5.0.0           # Progress bars
+wandb>=0.13.0,<1.0.0          # Experiment tracking (optional)
+
+# Configuration and utilities
+PyYAML>=6.0,<7.0              # YAML configuration files
+omegaconf>=2.2.0,<3.0.0       # Advanced configuration management
+hydra-core>=1.2.0,<2.0.0      # Configuration composition (optional)
+
+# Data handling
+h5py>=3.7.0,<4.0.0           # HDF5 for efficient data storage
+pandas>=1.4.0,<3.0.0          # Data manipulation and analysis
+
+# Audio quality metrics (optional)
+pesq>=0.0.4,<1.0.0           # Perceptual evaluation
+pystoi>=0.3.3,<1.0.0         # Short-time objective intelligibility
+speechmetrics>=1.0.0,<2.0.0  # Comprehensive audio metrics
+
+# Model optimization
+onnx>=1.12.0,<2.0.0          # Model export and optimization
+onnxruntime>=1.12.0,<2.0.0   # ONNX runtime for inference
+
+# Development and testing
+pytest>=7.0.0,<8.0.0         # Unit testing framework
+pytest-cov>=3.0.0,<5.0.0     # Coverage reporting
+black>=22.0.0,<24.0.0        # Code formatting
+isort>=5.10.0,<6.0.0         # Import sorting
+flake8>=4.0.0,<7.0.0         # Code linting
+mypy>=0.991,<2.0.0           # Static type checking
+
+# Distributed training
+nccl>=2.0.0                  # NVIDIA Collective Communications Library
+
+# Performance profiling
+py-spy>=0.3.0,<1.0.0         # Python profiler
+memory-profiler>=0.60.0,<1.0.0  # Memory usage profiling
+psutil>=5.9.0,<6.0.0         # System and process utilities
+
+# Audio codec evaluation
+museval>=0.4.0,<1.0.0        # Music source separation evaluation
+mir-eval>=0.7,<1.0.0         # Music information retrieval evaluation
+
+# Optional dependencies for advanced features
+# ==========================================
+
+# Intel MKL for optimized CPU operations (Intel systems)
+# mkl>=2022.0.0,<2024.0.0
+
+# NVIDIA optimizations (CUDA systems)
+# nvidia-ml-py3>=7.352.0,<12.0.0
+
+# Advanced audio processing
+# madmom>=0.16.1,<1.0.0      # Audio signal processing
+# essentia>=2.1b6.dev1034,<3.0.0  # Audio analysis library
+
+# Model compression
+# torch-pruning>=1.0.0,<2.0.0     # Neural network pruning
+# pytorch-quantization>=2.1.0,<3.0.0  # Quantization toolkit
+
+# Experimental features
+# timm>=0.6.0,<1.0.0         # PyTorch image models (for inspiration)
+# transformers>=4.20.0,<5.0.0 # Hugging Face transformers (for reference)
+
+# Alternative backends
+# jax[cuda]>=0.3.0,<1.0.0    # JAX for alternative implementation
+# flax>=0.6.0,<1.0.0         # Flax neural networks
