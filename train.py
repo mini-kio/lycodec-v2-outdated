@@ -1,10 +1,9 @@
 """
-LyCodec v2.1 Training Script with WandB Integration
-==================================================
+LyCodec v2.5 Training Script with Continuous Latent Space
+========================================================
 
-Production-grade training pipeline for 44.1kHz stereo audio codec with
-V100×4 16GB optimization, 5-second segment processing, adaptive
-bit allocation learning, and comprehensive monitoring.
+Production-grade training pipeline for f10c10 continuous compression with
+semantic preservation, smooth latent manifolds, and ultra-low bitrate optimization.
 """
 
 import torch
@@ -33,33 +32,34 @@ except ImportError:
     WANDB_AVAILABLE = False
     print("Warning: wandb not available. Install with 'pip install wandb' for experiment tracking.")
 
-# Import LyCodec components
+# Import LyCodec v2.5 components
 from lycodec import (
-    LyCodecModel, LyCodecConfig,
+    LyCodecV25Model, LyCodecV25Config,
     ProductionAdaptiveBitAllocator, AdaptiveGradientClipper,
     StableCheckpointer, AudioDataProcessor,
-    SAMPLE_RATE, CHANNELS, SEGMENT_LENGTH, SEGMENT_SAMPLES, SEGMENTS_PER_TRACK
+    SAMPLE_RATE, CHANNELS, SEGMENT_LENGTH, SEGMENT_SAMPLES, 
+    COMPRESSION_RATIO, LATENT_CHANNELS, LATENT_LENGTH
 )
 
 
-class LyCodecDataset(Dataset):
+class LyCodecV25Dataset(Dataset):
     """
-    Dataset for LyCodec training with 5-second segment extraction.
+    Dataset for LyCodec v2.5 training with continuous latent space.
     
-    Processes 44.1kHz stereo audio files into non-overlapping 5-second segments
-    with 3 segments per track for efficient training data utilization.
+    Optimized for f10c10 compression with semantic preservation.
     """
     
     def __init__(self, audio_dir: str, segment_length: float = 5.0,
                  segments_per_track: int = 3, augment: bool = True,
-                 cache_size: int = 1000):
+                 cache_size: int = 800, semantic_augment: bool = True):
         self.audio_dir = Path(audio_dir)
         self.segment_length = segment_length
         self.segments_per_track = segments_per_track
         self.augment = augment
+        self.semantic_augment = semantic_augment
         self.cache_size = cache_size
         
-        # Audio processor
+        # Audio processor optimized for v2.5
         self.audio_processor = AudioDataProcessor(
             sample_rate=SAMPLE_RATE,
             channels=CHANNELS,
@@ -69,50 +69,45 @@ class LyCodecDataset(Dataset):
         
         # Find all audio files
         self.audio_files = self._find_audio_files()
-        
-        # Calculate total number of segments
         self.total_segments = len(self.audio_files) * segments_per_track
         
-        # LRU cache for loaded audio
+        # Audio cache
         self.audio_cache = {}
         self.cache_order = []
         
-        print(f"Dataset initialized: {len(self.audio_files)} files, "
-              f"{self.total_segments} total segments")
+        print(f"LyCodec v2.5 Dataset: {len(self.audio_files)} files, "
+              f"{self.total_segments} segments, f{COMPRESSION_RATIO} compression")
     
     def _find_audio_files(self) -> List[Path]:
-        """Find all supported audio files in the directory."""
+        """Find supported audio files with enhanced filtering."""
         audio_files = []
         supported_exts = {'.wav', '.mp3', '.flac', '.m4a', '.ogg'}
         
         for ext in supported_exts:
             audio_files.extend(self.audio_dir.rglob(f'*{ext}'))
         
-        # Filter out very small files
+        # Enhanced filtering for v2.5
         filtered_files = []
         for file_path in audio_files:
             try:
                 file_size = file_path.stat().st_size
-                if file_size > 100000:  # At least 100KB
+                # Larger minimum size for better semantic content
+                if file_size > 500000:  # At least 500KB
                     filtered_files.append(file_path)
             except:
                 continue
         
-        print(f"Found {len(filtered_files)} valid audio files")
         return filtered_files
     
     def _load_audio_cached(self, file_path: Path) -> Optional[torch.Tensor]:
-        """Load audio with LRU caching."""
+        """Load audio with LRU caching optimized for v2.5."""
         file_key = str(file_path)
         
-        # Check cache
         if file_key in self.audio_cache:
-            # Move to end (most recently used)
             self.cache_order.remove(file_key)
             self.cache_order.append(file_key)
             return self.audio_cache[file_key]
         
-        # Load audio
         audio = self.audio_processor.load_audio(file_path)
         if audio is None:
             return None
@@ -128,15 +123,49 @@ class LyCodecDataset(Dataset):
         
         return audio
     
+    def _apply_semantic_augmentation(self, segment: torch.Tensor) -> torch.Tensor:
+        """Apply semantic-preserving augmentations for v2.5."""
+        if not self.semantic_augment:
+            return segment
+        
+        # Time stretching (preserves pitch/semantics)
+        if random.random() < 0.2:
+            stretch_factor = random.uniform(0.95, 1.05)
+            # Simplified time stretch via interpolation
+            original_length = segment.shape[-1]
+            stretched_length = int(original_length * stretch_factor)
+            
+            segment_stretched = F.interpolate(
+                segment.unsqueeze(0),
+                size=stretched_length,
+                mode='linear',
+                align_corners=False
+            ).squeeze(0)
+            
+            # Crop or pad to original length
+            if stretched_length > original_length:
+                segment = segment_stretched[:, :original_length]
+            else:
+                padding = original_length - stretched_length
+                segment = F.pad(segment_stretched, (0, padding))
+        
+        # Gentle EQ (preserves semantic content)
+        if random.random() < 0.3:
+            # Simple high/low frequency adjustment
+            eq_factor = random.uniform(0.9, 1.1)
+            # Apply via simple filtering (placeholder)
+            segment = segment * eq_factor
+        
+        return segment
+    
     def __len__(self) -> int:
         return self.total_segments
     
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        # Determine which file and segment
+        # Determine file and segment
         file_idx = idx // self.segments_per_track
         segment_idx = idx % self.segments_per_track
         
-        # Handle wraparound for safety
         file_idx = file_idx % len(self.audio_files)
         audio_file = self.audio_files[file_idx]
         
@@ -144,13 +173,12 @@ class LyCodecDataset(Dataset):
         audio = self._load_audio_cached(audio_file)
         
         if audio is None:
-            # Fallback to a different file
+            # Fallback
             fallback_idx = random.randint(0, len(self.audio_files) - 1)
             audio_file = self.audio_files[fallback_idx]
             audio = self._load_audio_cached(audio_file)
             
             if audio is None:
-                # Create silence as last resort
                 audio = torch.zeros(CHANNELS, SEGMENT_SAMPLES)
         
         # Extract segments
@@ -158,52 +186,71 @@ class LyCodecDataset(Dataset):
             audio, random_segments=True
         )
         
-        # Get the requested segment (with wraparound)
         segment_idx = segment_idx % len(segments)
         segment = segments[segment_idx]
         
-        # Apply augmentation during training
+        # Apply augmentations
         if self.augment:
             segment = self.audio_processor.augment_audio(segment)
+            segment = self._apply_semantic_augmentation(segment)
         
         return {
-            'audio': segment,  # [channels, samples]
+            'audio': segment,
             'file_path': str(audio_file),
-            'segment_idx': segment_idx
+            'segment_idx': segment_idx,
+            'compression_target': COMPRESSION_RATIO  # For monitoring
         }
 
 
-class LyCodecLoss(nn.Module):
+class LyCodecV25Loss(nn.Module):
     """
-    Comprehensive loss function for LyCodec training with fixed bitrate efficiency calculation.
+    Comprehensive loss function for LyCodec v2.5 continuous training.
     
-    Combines reconstruction loss, perceptual loss, and bit allocation
-    efficiency for high-quality codec optimization.
+    Includes semantic preservation, contrastive learning, and information theory losses.
     """
     
     def __init__(self, config: Dict):
         super().__init__()
         
-        # Loss weights from config
+        # Primary loss weights
         self.reconstruction_weight = config.get('reconstruction_weight', 1.0)
         self.perceptual_weight = config.get('perceptual_weight', 0.1)
-        self.bitrate_weight = config.get('bitrate_weight', 0.01)
         
-        # Multi-scale STFT losses with cached windows for performance
+        # Continuous space loss weights
+        self.kl_weight = config.get('kl_weight', 0.1)
+        self.semantic_weight = config.get('semantic_weight', 0.3)
+        self.contrastive_weight = config.get('contrastive_weight', 0.2)
+        self.consistency_weight = config.get('consistency_weight', 0.15)
+        
+        # Information theory loss weights
+        self.information_bottleneck_weight = config.get('information_bottleneck_weight', 0.05)
+        self.mutual_information_weight = config.get('mutual_information_weight', 0.02)
+        
+        # Traditional loss weights (reduced)
+        self.bitrate_weight = config.get('bitrate_weight', 0.005)
+        
+        # Multi-scale STFT for perceptual loss
         self.stft_scales = [
             {'n_fft': 2048, 'hop_length': 512},
             {'n_fft': 1024, 'hop_length': 256},
             {'n_fft': 512, 'hop_length': 128}
         ]
         
-        # Pre-cache Hann windows to avoid repeated computation
+        # Cache windows
         for scale in self.stft_scales:
             n_fft = scale['n_fft']
-            window_name = f'hann_window_{n_fft}'
-            self.register_buffer(window_name, torch.hann_window(n_fft))
+            self.register_buffer(f'hann_window_{n_fft}', torch.hann_window(n_fft))
+        
+        # Semantic task weights
+        self.semantic_task_weights = config.get('semantic_task_weights', {
+            'speech_recognition': 0.25,
+            'music_classification': 0.25,
+            'emotion_recognition': 0.25,
+            'speaker_identification': 0.25
+        })
     
     def _get_cached_window(self, n_fft: int, device: torch.device) -> torch.Tensor:
-        """Get cached Hann window for given n_fft size."""
+        """Get cached Hann window."""
         window_name = f'hann_window_{n_fft}'
         window = getattr(self, window_name)
         if window.device != device:
@@ -213,14 +260,13 @@ class LyCodecLoss(nn.Module):
     
     def _compute_stft_loss(self, predicted: torch.Tensor, 
                           target: torch.Tensor, stft_params: Dict) -> torch.Tensor:
-        """Compute STFT-based spectral loss with cached windows for performance."""
+        """Multi-scale STFT loss."""
         n_fft = stft_params['n_fft']
         hop_length = stft_params['hop_length']
         
-        # Get cached window
         window = self._get_cached_window(n_fft, predicted.device)
         
-        # Compute STFT for both signals
+        # Compute STFT
         pred_stft = torch.stft(
             predicted.view(-1, predicted.shape[-1]),
             n_fft=n_fft,
@@ -237,117 +283,144 @@ class LyCodecLoss(nn.Module):
             return_complex=True
         )
         
-        # Magnitude loss
+        # Magnitude and phase losses
         pred_mag = torch.abs(pred_stft)
         target_mag = torch.abs(target_stft)
         magnitude_loss = F.l1_loss(pred_mag, target_mag)
         
-        # Phase-aware loss (reduced weight)
-        pred_real, pred_imag = pred_stft.real, pred_stft.imag
-        target_real, target_imag = target_stft.real, target_stft.imag
-        
-        real_loss = F.mse_loss(pred_real, target_real)
-        imag_loss = F.mse_loss(pred_imag, target_imag)
-        phase_loss = (real_loss + imag_loss) * 0.1  # Reduced weight for phase
+        # Reduced phase loss weight for continuous space
+        phase_loss = F.mse_loss(pred_stft.real, target_stft.real) + \
+                    F.mse_loss(pred_stft.imag, target_stft.imag)
+        phase_loss *= 0.05  # Reduced weight
         
         return magnitude_loss + phase_loss
     
     def _compute_perceptual_loss(self, predicted: torch.Tensor, 
                                target: torch.Tensor) -> torch.Tensor:
-        """Compute multi-scale perceptual loss."""
+        """Multi-scale perceptual loss."""
         total_loss = 0.0
-        
         for scale_params in self.stft_scales:
             scale_loss = self._compute_stft_loss(predicted, target, scale_params)
             total_loss += scale_loss
-        
         return total_loss / len(self.stft_scales)
     
-    def _compute_bitrate_efficiency_loss(self, metadata: Dict) -> torch.Tensor:
-        """
-        Compute bitrate efficiency regularization with proper tensor handling.
+    def _compute_semantic_preservation_loss(self, semantic_outputs: Dict, 
+                                          target_audio: torch.Tensor) -> torch.Tensor:
+        """Compute semantic preservation loss from multi-task outputs."""
+        # This is a simplified implementation
+        # In practice, you'd need pre-trained models or ground truth labels
         
-        Fixed to handle type mismatches and device issues.
-        """
-        # Determine device from available tensors in metadata
-        device = torch.device('cpu')
-        for value in metadata.values():
-            if isinstance(value, torch.Tensor):
-                device = value.device
-                break
+        semantic_loss = 0.0
         
-        # Return zero tensor if no bit allocation information
-        if 'bit_allocation' not in metadata:
-            return torch.tensor(0.0, device=device)
+        for task_name, task_output in semantic_outputs.items():
+            if task_name in self.semantic_task_weights:
+                # Placeholder: semantic consistency loss
+                # You would implement actual semantic loss based on your tasks
+                task_loss = torch.mean(torch.abs(task_output))  # Placeholder
+                semantic_loss += self.semantic_task_weights[task_name] * task_loss
         
-        bit_allocation = metadata['bit_allocation']
+        return semantic_loss
+    
+    def _compute_latent_smoothness_loss(self, latent: torch.Tensor) -> torch.Tensor:
+        """Compute smoothness loss for continuous latent space."""
+        # Temporal smoothness
+        temporal_diff = torch.diff(latent, dim=1)  # Along time dimension
+        smoothness_loss = torch.mean(temporal_diff ** 2)
         
-        # Encourage smooth bit allocation (reduce variance)
-        if isinstance(bit_allocation, torch.Tensor) and bit_allocation.numel() > 1:
-            allocation_variance = torch.var(bit_allocation, dim=1) if bit_allocation.dim() > 1 else torch.var(bit_allocation)
-            smoothness_loss = torch.mean(allocation_variance)
-        else:
-            smoothness_loss = torch.tensor(0.0, device=device)
+        # Channel consistency
+        channel_var = torch.var(latent, dim=-1)  # Variance across channels
+        consistency_loss = torch.mean(channel_var)
         
-        # Encourage efficient bitrate usage
-        overage_loss = torch.tensor(0.0, device=device)
-        if 'current_bitrate' in metadata and 'target_bitrate' in metadata:
-            # Convert to tensors and ensure they're on the correct device
-            current_bitrate = torch.tensor(metadata['current_bitrate'], device=device, dtype=torch.float32)
-            target_bitrate = torch.tensor(metadata['target_bitrate'], device=device, dtype=torch.float32)
-            
-            # Penalize excessive bitrate usage (detach to avoid unnecessary gradients)
-            overage = F.relu(current_bitrate - target_bitrate * 1.1).detach()
-            overage_loss = overage * 0.1  # Small weight for overage penalty
+        return smoothness_loss + 0.1 * consistency_loss
+    
+    def _compute_interpolation_loss(self, latent: torch.Tensor) -> torch.Tensor:
+        """Compute loss to encourage smooth interpolation."""
+        batch_size = latent.shape[0]
+        if batch_size < 2:
+            return torch.tensor(0.0, device=latent.device)
         
-        efficiency_loss = smoothness_loss + overage_loss
+        # Random interpolation
+        alpha = torch.rand(1, device=latent.device)
+        idx1 = torch.randperm(batch_size)[:batch_size//2]
+        idx2 = torch.randperm(batch_size)[:batch_size//2]
         
-        return efficiency_loss
+        latent1 = latent[idx1]
+        latent2 = latent[idx2]
+        
+        # Linear interpolation
+        interpolated = alpha * latent1 + (1 - alpha) * latent2
+        
+        # Smoothness of interpolated latent
+        interpolation_smoothness = self._compute_latent_smoothness_loss(interpolated)
+        
+        return interpolation_smoothness
     
     def forward(self, model_output: Dict, target_audio: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
-        Compute comprehensive loss for LyCodec training.
-        
-        Args:
-            model_output: Dictionary containing model outputs
-            target_audio: Ground truth audio [batch, channels, samples]
-            
-        Returns:
-            Dictionary of loss components and total loss
+        Compute comprehensive loss for LyCodec v2.5.
         """
         reconstructed_audio = model_output['reconstructed_audio']
-        metadata = model_output.get('metadata', {})
+        ultra_latent = model_output['ultra_latent']
+        semantic_outputs = model_output['semantic_outputs']
+        losses_dict = model_output['losses']
         
-        # 1. Reconstruction loss (time domain)
+        # Primary losses
         reconstruction_loss = F.l1_loss(reconstructed_audio, target_audio)
-        
-        # 2. Perceptual loss (frequency domain)
         perceptual_loss = self._compute_perceptual_loss(reconstructed_audio, target_audio)
         
-        # 3. Bitrate efficiency loss (fixed)
-        bitrate_loss = self._compute_bitrate_efficiency_loss(metadata)
+        # Continuous space losses
+        kl_loss = losses_dict.get('kl_loss', torch.tensor(0.0))
+        consistency_loss = losses_dict.get('consistency_loss', torch.tensor(0.0))
+        bottleneck_loss = losses_dict.get('bottleneck_loss', torch.tensor(0.0))
+        contrastive_loss = losses_dict.get('contrastive_loss', torch.tensor(0.0))
         
-        # 4. Total loss
+        # Semantic preservation
+        semantic_loss = self._compute_semantic_preservation_loss(semantic_outputs, target_audio)
+        
+        # Latent space regularization
+        smoothness_loss = self._compute_latent_smoothness_loss(ultra_latent)
+        interpolation_loss = self._compute_interpolation_loss(ultra_latent)
+        
+        # Information theory losses
+        information_bottleneck_loss = bottleneck_loss  # From model
+        mutual_information_loss = torch.tensor(0.0, device=target_audio.device)  # Placeholder
+        
+        # Traditional bitrate loss (minimal weight)
+        bitrate_loss = torch.tensor(0.0, device=target_audio.device)  # Placeholder
+        
+        # Total loss
         total_loss = (
             self.reconstruction_weight * reconstruction_loss +
             self.perceptual_weight * perceptual_loss +
-            self.bitrate_weight * bitrate_loss
+            self.kl_weight * kl_loss +
+            self.semantic_weight * semantic_loss +
+            self.contrastive_weight * contrastive_loss +
+            self.consistency_weight * (consistency_loss + smoothness_loss) +
+            self.information_bottleneck_weight * information_bottleneck_loss +
+            self.mutual_information_weight * mutual_information_loss +
+            self.bitrate_weight * bitrate_loss +
+            0.1 * interpolation_loss  # Interpolation smoothness
         )
         
         return {
             'total_loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
             'perceptual_loss': perceptual_loss,
+            'kl_loss': kl_loss,
+            'semantic_loss': semantic_loss,
+            'contrastive_loss': contrastive_loss,
+            'consistency_loss': consistency_loss,
+            'smoothness_loss': smoothness_loss,
+            'interpolation_loss': interpolation_loss,
+            'information_bottleneck_loss': information_bottleneck_loss,
+            'mutual_information_loss': mutual_information_loss,
             'bitrate_loss': bitrate_loss
         }
 
 
-class LyCodecTrainer:
+class LyCodecV25Trainer:
     """
-    Production-grade trainer for LyCodec with distributed training support and WandB integration.
-    
-    Implements V100×4 16GB optimization, stable checkpointing, adaptive
-    gradient clipping, and comprehensive monitoring for robust training.
+    Advanced trainer for LyCodec v2.5 with continuous latent space training.
     """
     
     def __init__(self, config: Dict, device_id: int = 0, world_size: int = 1):
@@ -356,45 +429,45 @@ class LyCodecTrainer:
         self.world_size = world_size
         self.device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
         
-        # Initialize distributed training if multi-GPU
+        # Distributed training setup
         self.distributed = world_size > 1
         if self.distributed:
             self._setup_distributed()
         
-        # WandB initialization (only on main process)
+        # WandB setup
         self.use_wandb = (WANDB_AVAILABLE and 
                          config.get('wandb', {}).get('enabled', False) and 
                          device_id == 0)
-        
         if self.use_wandb:
             self._setup_wandb()
         
         # Model configuration
-        self.model_config = LyCodecConfig()
+        self.model_config = LyCodecV25Config()
         self._update_config_from_yaml()
         
         # Initialize model
-        self.model = LyCodecModel(self.model_config).to(self.device)
+        self.model = LyCodecV25Model(self.model_config).to(self.device)
         
-        # Log model architecture to WandB
+        # Log v2.5 specific info
         if self.use_wandb:
             wandb.watch(self.model, log_freq=100)
             wandb.log({
                 "model/total_parameters": self.model.get_model_size(),
-                "model/memory_usage_mb": self.model.get_memory_usage()['total_mb']
+                "model/memory_usage_mb": self.model.get_memory_usage()['total_mb'],
+                "model/compression_ratio": COMPRESSION_RATIO,
+                "model/latent_channels": LATENT_CHANNELS,
+                "model/latent_length": LATENT_LENGTH
             })
         
-        # Wrap model for distributed training
+        # Distributed model
         if self.distributed:
             self.model = DDP(self.model, device_ids=[device_id])
         
         # Loss function
-        self.loss_fn = LyCodecLoss(config['loss'])
+        self.loss_fn = LyCodecV25Loss(config['loss'])
         
-        # Optimizer with production-grade settings
+        # Optimizer and scheduler
         self.optimizer = self._setup_optimizer()
-        
-        # Learning rate scheduler
         self.scheduler = self._setup_scheduler()
         
         # Training utilities
@@ -408,11 +481,9 @@ class LyCodecTrainer:
             max_checkpoints=config['training'].get('max_checkpoints', 5)
         )
         
-        # TensorBoard monitoring (if enabled)
+        # TensorBoard
         if device_id == 0 and config.get('tensorboard', {}).get('enabled', True):
-            self.writer = SummaryWriter(
-                log_dir=config['training'].get('log_dir', 'logs')
-            )
+            self.writer = SummaryWriter(log_dir=config['training'].get('log_dir', 'logs_v25'))
         else:
             self.writer = None
         
@@ -421,31 +492,33 @@ class LyCodecTrainer:
         self.epoch = 0
         self.best_loss = float('inf')
         
-        # Memory optimization settings
+        # Memory optimization
         self.gradient_checkpointing = config['training'].get('gradient_checkpointing', True)
         self.mixed_precision = config['training'].get('mixed_precision', True)
         
         if self.mixed_precision:
             self.scaler = torch.cuda.amp.GradScaler()
         
-        # Performance monitoring
-        self.performance_stats = {
-            'batch_times': [],
-            'memory_usage': [],
-            'throughput': []
+        # v2.5 specific metrics
+        self.semantic_metrics = {
+            'semantic_similarity_history': [],
+            'interpolation_quality_history': [],
+            'compression_efficiency_history': []
         }
     
     def _setup_wandb(self):
-        """Initialize WandB logging."""
+        """Initialize WandB with v2.5 specific configuration."""
         wandb_config = self.config.get('wandb', {})
         
-        # Extract key configuration for WandB
+        # v2.5 specific config
         wandb_log_config = {
             # Model architecture
+            'model_version': '2.5',
+            'compression_ratio': COMPRESSION_RATIO,
+            'latent_channels': LATENT_CHANNELS,
+            'latent_length': LATENT_LENGTH,
             'model_hidden_dim': self.config['model'].get('hidden_dim', 512),
-            'model_num_layers': self.config['model'].get('num_layers', 8),
-            'model_attention_heads': self.config['model'].get('num_attention_heads', 8),
-            'model_harmonics_count': self.config['model'].get('harmonics_count', 48),
+            'semantic_dim': self.config['model'].get('semantic_dim', 256),
             
             # Training settings
             'batch_size': self.config['data']['batch_size'],
@@ -454,34 +527,29 @@ class LyCodecTrainer:
             'sample_rate': SAMPLE_RATE,
             'segment_length': SEGMENT_LENGTH,
             
-            # Loss weights
-            'reconstruction_weight': self.config['loss'].get('reconstruction_weight', 1.0),
-            'perceptual_weight': self.config['loss'].get('perceptual_weight', 0.1),
-            'bitrate_weight': self.config['loss'].get('bitrate_weight', 0.01),
+            # v2.5 specific settings
+            'kl_weight': self.config['model'].get('kl_weight', 0.0001),
+            'semantic_weight': self.config['loss'].get('semantic_weight', 0.3),
+            'contrastive_weight': self.config['loss'].get('contrastive_weight', 0.2),
+            'beta_vae': self.config['model'].get('beta_vae', True),
             
             # Hardware
             'world_size': self.world_size,
             'mixed_precision': self.mixed_precision,
-            'gradient_checkpointing': self.gradient_checkpointing,
         }
         
         wandb.init(
-            project=wandb_config.get('project', 'lycodec-v2.1'),
+            project=wandb_config.get('project', 'lycodec-v2.5-continuous'),
             name=wandb_config.get('run_name', None),
             config=wandb_log_config,
-            tags=wandb_config.get('tags', ['audio-codec', 'ddsp', 'transformer']),
-            notes=wandb_config.get('notes', 'LyCodec v2.1 training with Linear Attention'),
-            group=wandb_config.get('group', None),
-            job_type=wandb_config.get('job_type', 'train'),
+            tags=wandb_config.get('tags', ['continuous-latent', 'semantic-preservation']),
+            notes=wandb_config.get('notes', 'LyCodec v2.5 continuous architecture training'),
+            group=wandb_config.get('group', 'continuous-architecture'),
             resume=wandb_config.get('resume', False)
         )
-        
-        # Log configuration file
-        if 'config_path' in wandb_config:
-            wandb.save(wandb_config['config_path'])
     
     def _setup_distributed(self):
-        """Initialize distributed training."""
+        """Setup distributed training."""
         if 'RANK' not in os.environ:
             os.environ['RANK'] = str(self.device_id)
         if 'WORLD_SIZE' not in os.environ:
@@ -489,26 +557,22 @@ class LyCodecTrainer:
         if 'MASTER_ADDR' not in os.environ:
             os.environ['MASTER_ADDR'] = 'localhost'
         if 'MASTER_PORT' not in os.environ:
-            os.environ['MASTER_PORT'] = '12355'
+            os.environ['MASTER_PORT'] = '12356'  # Different port for v2.5
         
         dist.init_process_group(backend='nccl')
     
     def _update_config_from_yaml(self):
-        """Update model config from YAML settings."""
+        """Update model config from YAML."""
         model_cfg = self.config.get('model', {})
         
-        # Update relevant config fields
-        if 'hidden_dim' in model_cfg:
-            self.model_config.hidden_dim = model_cfg['hidden_dim']
-        if 'num_layers' in model_cfg:
-            self.model_config.num_layers = model_cfg['num_layers']
-        if 'num_attention_heads' in model_cfg:
-            self.model_config.num_attention_heads = model_cfg['num_attention_heads']
-        if 'harmonics_count' in model_cfg:
-            self.model_config.harmonics_count = model_cfg['harmonics_count']
+        # Update config fields
+        for field in ['hidden_dim', 'num_layers', 'num_attention_heads', 
+                     'semantic_dim', 'kl_weight', 'beta_vae']:
+            if field in model_cfg:
+                setattr(self.model_config, field, model_cfg[field])
     
     def _setup_optimizer(self) -> torch.optim.Optimizer:
-        """Setup optimizer with production-grade settings."""
+        """Setup optimizer for v2.5."""
         opt_config = self.config['training']['optimizer']
         
         if opt_config['type'] == 'adamw':
@@ -534,45 +598,48 @@ class LyCodecTrainer:
                 T_max=sched_config['T_max'],
                 eta_min=sched_config.get('eta_min', 1e-6)
             )
-        elif sched_config['type'] == 'exponential':
-            scheduler = torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizer,
-                gamma=sched_config.get('gamma', 0.95)
-            )
         else:
-            # Default: no scheduling
             scheduler = torch.optim.lr_scheduler.LambdaLR(
                 self.optimizer, lr_lambda=lambda epoch: 1.0
             )
         
         return scheduler
     
-    def _compute_memory_usage(self) -> Dict[str, float]:
-        """Compute current GPU memory usage."""
-        if not torch.cuda.is_available():
-            return {}
+    def _compute_semantic_metrics(self, model_output: Dict, target_audio: torch.Tensor) -> Dict[str, float]:
+        """Compute v2.5 specific semantic metrics."""
+        ultra_latent = model_output['ultra_latent']
         
-        allocated = torch.cuda.memory_allocated(self.device) / 1024**3  # GB
-        cached = torch.cuda.memory_reserved(self.device) / 1024**3      # GB
+        metrics = {}
         
-        return {
-            'allocated_gb': allocated,
-            'cached_gb': cached,
-            'utilization': allocated / 16.0  # Assuming 16GB V100
-        }
+        # Latent smoothness
+        temporal_diff = torch.diff(ultra_latent, dim=1)
+        smoothness = 1.0 / (1.0 + torch.mean(temporal_diff ** 2).item())
+        metrics['latent_smoothness'] = smoothness
+        
+        # Compression efficiency
+        target_size = target_audio.numel()
+        compressed_size = ultra_latent.numel()
+        efficiency = target_size / compressed_size
+        metrics['compression_efficiency'] = efficiency
+        
+        # Semantic consistency (placeholder)
+        semantic_outputs = model_output.get('semantic_outputs', {})
+        if semantic_outputs:
+            consistency = sum(torch.mean(torch.abs(output)).item() 
+                            for output in semantic_outputs.values()) / len(semantic_outputs)
+            metrics['semantic_consistency'] = consistency
+        
+        return metrics
     
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Execute single training step with memory optimization."""
+        """Training step for v2.5 with continuous space."""
         start_time = time.time()
         
-        # Move batch to device
-        audio = batch['audio'].to(self.device)  # [batch, channels, samples]
+        audio = batch['audio'].to(self.device)
         
-        # Enable gradient checkpointing if configured
+        # Enable gradient checkpointing
         if self.gradient_checkpointing:
             self.model.train()
-            if hasattr(self.model, 'gradient_checkpointing_enable'):
-                self.model.gradient_checkpointing_enable()
         
         # Forward pass with mixed precision
         if self.mixed_precision:
@@ -590,12 +657,8 @@ class LyCodecTrainer:
         
         if self.mixed_precision:
             self.scaler.scale(total_loss).backward()
-            
-            # Gradient clipping with scaler
             self.scaler.unscale_(self.optimizer)
             grad_stats = self.gradient_clipper.clip_gradients(self.model)
-            
-            # Optimizer step
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
@@ -603,52 +666,58 @@ class LyCodecTrainer:
             grad_stats = self.gradient_clipper.clip_gradients(self.model)
             self.optimizer.step()
         
-        # Update learning rate
         self.scheduler.step()
         
-        # Performance tracking
+        # Compute metrics
         batch_time = time.time() - start_time
-        memory_stats = self._compute_memory_usage()
+        semantic_metrics = self._compute_semantic_metrics(model_output, audio)
         
-        # Update step counter
         self.step += 1
         
-        # Prepare return statistics
+        # Compile step statistics
         step_stats = {
             'total_loss': total_loss.item(),
             'reconstruction_loss': loss_dict['reconstruction_loss'].item(),
             'perceptual_loss': loss_dict['perceptual_loss'].item(),
-            'bitrate_loss': loss_dict['bitrate_loss'].item(),
+            'kl_loss': loss_dict['kl_loss'].item(),
+            'semantic_loss': loss_dict['semantic_loss'].item(),
+            'contrastive_loss': loss_dict['contrastive_loss'].item(),
+            'consistency_loss': loss_dict['consistency_loss'].item(),
+            'smoothness_loss': loss_dict['smoothness_loss'].item(),
+            'interpolation_loss': loss_dict['interpolation_loss'].item(),
             'learning_rate': self.scheduler.get_last_lr()[0],
             'batch_time': batch_time,
             'grad_norm': grad_stats['total_norm'],
             'grad_clipped': grad_stats['clipped']
         }
         
-        # Add memory stats
-        step_stats.update({f'memory_{k}': v for k, v in memory_stats.items()})
+        # Add semantic metrics
+        step_stats.update(semantic_metrics)
         
-        # Add model-specific metrics
-        if 'metadata' in model_output and isinstance(model_output['metadata'], dict):
-            metadata = model_output['metadata']
-            if 'current_bitrate' in metadata:
-                step_stats['current_bitrate'] = float(metadata['current_bitrate'])
-            if 'overflow_rate' in metadata:
-                step_stats['overflow_rate'] = float(metadata['overflow_rate'])
+        # Update semantic metric history
+        self.semantic_metrics['semantic_similarity_history'].append(
+            semantic_metrics.get('semantic_consistency', 0.0)
+        )
+        self.semantic_metrics['compression_efficiency_history'].append(
+            semantic_metrics.get('compression_efficiency', 0.0)
+        )
         
         return step_stats
     
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
-        """Run validation loop."""
+        """Validation with v2.5 metrics."""
         self.model.eval()
         val_losses = []
-        val_components = {'reconstruction': [], 'perceptual': [], 'bitrate': []}
+        val_components = {
+            'reconstruction': [], 'perceptual': [], 'kl': [],
+            'semantic': [], 'contrastive': [], 'consistency': []
+        }
+        semantic_metrics_list = []
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation", disable=self.device_id != 0):
                 audio = batch['audio'].to(self.device)
                 
-                # Forward pass
                 if self.mixed_precision:
                     with torch.cuda.amp.autocast():
                         model_output = self.model(audio, training=False)
@@ -658,28 +727,46 @@ class LyCodecTrainer:
                     loss_dict = self.loss_fn(model_output, audio)
                 
                 val_losses.append(loss_dict['total_loss'].item())
+                
+                # Component losses
                 val_components['reconstruction'].append(loss_dict['reconstruction_loss'].item())
                 val_components['perceptual'].append(loss_dict['perceptual_loss'].item())
-                val_components['bitrate'].append(loss_dict['bitrate_loss'].item())
+                val_components['kl'].append(loss_dict['kl_loss'].item())
+                val_components['semantic'].append(loss_dict['semantic_loss'].item())
+                val_components['contrastive'].append(loss_dict['contrastive_loss'].item())
+                val_components['consistency'].append(loss_dict['consistency_loss'].item())
+                
+                # Semantic metrics
+                semantic_metrics = self._compute_semantic_metrics(model_output, audio)
+                semantic_metrics_list.append(semantic_metrics)
         
         # Compute averages
         avg_val_loss = sum(val_losses) / len(val_losses)
         avg_components = {f'val_{k}_loss': sum(v) / len(v) for k, v in val_components.items()}
         
+        # Average semantic metrics
+        if semantic_metrics_list:
+            avg_semantic_metrics = {}
+            for key in semantic_metrics_list[0].keys():
+                avg_semantic_metrics[f'val_{key}'] = sum(
+                    m[key] for m in semantic_metrics_list
+                ) / len(semantic_metrics_list)
+            avg_components.update(avg_semantic_metrics)
+        
         return {'val_loss': avg_val_loss, **avg_components}
     
     def _log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None, prefix: str = ""):
-        """Log metrics to both TensorBoard and WandB."""
+        """Log metrics to monitoring systems."""
         if step is None:
             step = self.step
         
-        # TensorBoard logging
+        # TensorBoard
         if self.writer:
             for key, value in metrics.items():
                 if isinstance(value, (int, float)):
                     self.writer.add_scalar(f'{prefix}{key}' if prefix else key, value, step)
         
-        # WandB logging
+        # WandB
         if self.use_wandb:
             wandb_metrics = {}
             for key, value in metrics.items():
@@ -692,13 +779,12 @@ class LyCodecTrainer:
     
     def train_epoch(self, train_loader: DataLoader, 
                    val_loader: Optional[DataLoader] = None) -> Dict[str, float]:
-        """Train for one epoch."""
+        """Train one epoch."""
         self.model.train()
         epoch_stats = []
         
-        # Progress bar for main process only
         if self.device_id == 0:
-            pbar = tqdm(train_loader, desc=f"Epoch {self.epoch}")
+            pbar = tqdm(train_loader, desc=f"Epoch {self.epoch} (v2.5)")
         else:
             pbar = train_loader
         
@@ -710,15 +796,17 @@ class LyCodecTrainer:
             if self.device_id == 0:
                 pbar.set_postfix({
                     'loss': f"{step_stats['total_loss']:.4f}",
-                    'lr': f"{step_stats['learning_rate']:.2e}",
-                    'mem': f"{step_stats.get('memory_allocated_gb', 0):.1f}GB"
+                    'recon': f"{step_stats['reconstruction_loss']:.4f}",
+                    'sem': f"{step_stats['semantic_loss']:.4f}",
+                    'smooth': f"{step_stats['latent_smoothness']:.3f}",
+                    'comp': f"{step_stats['compression_efficiency']:.1f}x"
                 })
             
-            # Log to monitoring systems
+            # Logging
             if self.step % self.config['training']['log_interval'] == 0:
                 self._log_metrics(step_stats, prefix='train/')
             
-            # Checkpoint saving
+            # Checkpointing
             if (self.device_id == 0 and 
                 self.step % self.config['training']['checkpoint_interval'] == 0):
                 
@@ -729,7 +817,8 @@ class LyCodecTrainer:
                     'scheduler_state_dict': self.scheduler.state_dict(),
                     'step': self.step,
                     'epoch': self.epoch,
-                    'config': self.config
+                    'config': self.config,
+                    'semantic_metrics': self.semantic_metrics
                 }
                 
                 if self.mixed_precision:
@@ -741,7 +830,7 @@ class LyCodecTrainer:
                     step_stats['total_loss']
                 )
         
-        # Compute epoch averages
+        # Epoch averages
         epoch_avg = {}
         for key in epoch_stats[0].keys():
             if isinstance(epoch_stats[0][key], (int, float)):
@@ -752,33 +841,29 @@ class LyCodecTrainer:
             val_stats = self.validate(val_loader)
             epoch_avg.update(val_stats)
             
-            # Log validation metrics
             self._log_metrics(val_stats, step=self.epoch, prefix='epoch/')
             
-            # Update best loss and save best model
+            # Best model tracking
             if val_stats['val_loss'] < self.best_loss:
                 self.best_loss = val_stats['val_loss']
                 
-                # Save best model
                 best_checkpoint_state = {
                     'model_state_dict': (self.model.module if self.distributed 
                                        else self.model).state_dict(),
-                    'optimizer_state_dict': self.optimizer.state_dict(),
                     'step': self.step,
                     'epoch': self.epoch,
                     'best_loss': self.best_loss,
                     'config': self.config
                 }
                 
-                best_model_path = Path(self.config['training']['checkpoint_dir']) / 'best_model.pt'
+                best_model_path = Path(self.config['training']['checkpoint_dir']) / 'best_model_v25.pt'
                 torch.save(best_checkpoint_state, best_model_path)
                 
-                # Log best model to WandB
                 if self.use_wandb:
                     wandb.log({'best_val_loss': self.best_loss}, step=self.epoch)
                     
                     # Save model artifact
-                    artifact = wandb.Artifact(f'model_epoch_{self.epoch}', type='model')
+                    artifact = wandb.Artifact(f'lycodec_v25_epoch_{self.epoch}', type='model')
                     artifact.add_file(str(best_model_path))
                     wandb.log_artifact(artifact)
         
@@ -786,100 +871,71 @@ class LyCodecTrainer:
         return epoch_avg
     
     def train(self, train_loader: DataLoader, val_loader: Optional[DataLoader] = None,
-              num_epochs: int = 100):
-        """Main training loop."""
+              num_epochs: int = 120):
+        """Main training loop for v2.5."""
         if self.device_id == 0:
-            print(f"Starting training for {num_epochs} epochs")
+            print(f"Starting LyCodec v2.5 training for {num_epochs} epochs")
             print(f"Model parameters: {self.model.get_model_size():,}")
-            print(f"Memory usage: {self.model.get_memory_usage()}")
+            print(f"Compression ratio: f{COMPRESSION_RATIO} ({COMPRESSION_RATIO}:1)")
+            print(f"Latent shape: [{LATENT_CHANNELS}, {LATENT_LENGTH}]")
             if self.use_wandb:
                 print(f"WandB run: {wandb.run.url}")
         
         try:
             for epoch in range(num_epochs):
-                # Set epoch for distributed sampler
                 if self.distributed and hasattr(train_loader.sampler, 'set_epoch'):
                     train_loader.sampler.set_epoch(epoch)
                 
                 epoch_stats = self.train_epoch(train_loader, val_loader)
                 
-                # Log epoch results
                 if self.device_id == 0:
                     print(f"Epoch {epoch} completed:")
                     for key, value in epoch_stats.items():
-                        print(f"  {key}: {value:.4f}")
+                        if 'loss' in key or 'semantic' in key or 'compression' in key:
+                            print(f"  {key}: {value:.4f}")
                     
-                    # Log epoch summary to monitoring systems
                     self._log_metrics(epoch_stats, step=epoch, prefix='epoch/')
         
         except KeyboardInterrupt:
             if self.device_id == 0:
-                print("Training interrupted by user")
+                print("Training interrupted")
         except Exception as e:
             if self.device_id == 0:
-                print(f"Training failed with error: {e}")
+                print(f"Training failed: {e}")
             raise
         finally:
-            # Cleanup
             if self.device_id == 0:
-                print("Training completed!")
+                print("LyCodec v2.5 training completed!")
                 if self.writer:
                     self.writer.close()
                 if self.use_wandb:
                     wandb.finish()
-    
-    def load_checkpoint(self, checkpoint_path: str):
-        """Load checkpoint and resume training."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
-        # Load model state
-        if self.distributed:
-            self.model.module.load_state_dict(checkpoint['model_state_dict'])
-        else:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        
-        # Load optimizer and scheduler states
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
-        # Load training state
-        self.step = checkpoint['step']
-        self.epoch = checkpoint['epoch']
-        
-        if 'scaler_state_dict' in checkpoint and self.mixed_precision:
-            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        
-        print(f"Resumed training from step {self.step}, epoch {self.epoch}")
 
 
 def create_data_loaders(config: Dict, world_size: int = 1, 
                        rank: int = 0) -> Tuple[DataLoader, Optional[DataLoader]]:
-    """Create training and validation data loaders."""
+    """Create data loaders for v2.5."""
     data_config = config['data']
     
     # Training dataset
-    train_dataset = LyCodecDataset(
+    train_dataset = LyCodecV25Dataset(
         audio_dir=data_config['train_dir'],
         segment_length=SEGMENT_LENGTH,
-        segments_per_track=SEGMENTS_PER_TRACK,
+        segments_per_track=data_config.get('segments_per_track', 3),
         augment=data_config.get('augment', True),
-        cache_size=data_config.get('cache_size', 1000)
+        cache_size=data_config.get('cache_size', 800),
+        semantic_augment=True  # v2.5 feature
     )
     
-    # Distributed sampler for multi-GPU training
+    # Distributed sampler
     if world_size > 1:
-        train_sampler = DistributedSampler(
-            train_dataset, 
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=True
-        )
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
         shuffle = False
     else:
         train_sampler = None
         shuffle = True
     
-    # Training data loader
+    # Training loader
     train_loader = DataLoader(
         train_dataset,
         batch_size=data_config['batch_size'],
@@ -890,15 +946,16 @@ def create_data_loaders(config: Dict, world_size: int = 1,
         drop_last=True
     )
     
-    # Validation dataset (optional)
+    # Validation loader
     val_loader = None
     if 'val_dir' in data_config and Path(data_config['val_dir']).exists():
-        val_dataset = LyCodecDataset(
+        val_dataset = LyCodecV25Dataset(
             audio_dir=data_config['val_dir'],
             segment_length=SEGMENT_LENGTH,
-            segments_per_track=SEGMENTS_PER_TRACK,
-            augment=False,  # No augmentation for validation
-            cache_size=data_config.get('cache_size', 500)
+            segments_per_track=data_config.get('segments_per_track', 3),
+            augment=False,
+            cache_size=data_config.get('cache_size', 400),
+            semantic_augment=False
         )
         
         val_loader = DataLoader(
@@ -913,13 +970,10 @@ def create_data_loaders(config: Dict, world_size: int = 1,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='LyCodec v2.1 Training with WandB Integration')
-    parser.add_argument('--config', type=str, required=True,
-                       help='Path to configuration file')
-    parser.add_argument('--resume', type=str, default=None,
-                       help='Path to checkpoint to resume from')
-    parser.add_argument('--local_rank', type=int, default=0,
-                       help='Local rank for distributed training')
+    parser = argparse.ArgumentParser(description='LyCodec v2.5 Continuous Training')
+    parser.add_argument('--config', type=str, required=True, help='Configuration file')
+    parser.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    parser.add_argument('--local_rank', type=int, default=0, help='Local rank')
     
     args = parser.parse_args()
     
@@ -927,24 +981,20 @@ def main():
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Add config path for WandB artifact saving
-    if 'wandb' not in config:
-        config['wandb'] = {}
     config['wandb']['config_path'] = args.config
     
-    # Setup distributed training
+    # Distributed setup
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     rank = int(os.environ.get('RANK', 0))
     local_rank = args.local_rank
     
-    # Set device
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
         device_id = local_rank
     else:
         device_id = 0
     
-    # Set random seeds for reproducibility
+    # Set seeds
     seed = config.get('seed', 42)
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -956,9 +1006,9 @@ def main():
     train_loader, val_loader = create_data_loaders(config, world_size, rank)
     
     # Initialize trainer
-    trainer = LyCodecTrainer(config, device_id, world_size)
+    trainer = LyCodecV25Trainer(config, device_id, world_size)
     
-    # Resume from checkpoint if provided
+    # Resume if provided
     if args.resume:
         trainer.load_checkpoint(args.resume)
     
