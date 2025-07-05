@@ -1,10 +1,11 @@
 """
-LyCodec v2.1 Main Model Architecture
-===================================
+LyCodec v2.1 Main Model Architecture - Fixed Linear Attention Only
+=================================================================
 
 Production-ready audio codec architecture with enhanced psychoacoustic modeling
 and DDSP vocoder synthesis. Optimized for 44.1kHz stereo with ~45M parameters
-targeting V100×4 16GB training and <8GB inference.
+targeting V100×4 16GB training and <8GB inference. Uses exclusively Linear Attention.
+Fixed dimension handling and einsum issues.
 """
 
 import torch
@@ -178,10 +179,10 @@ class BottleneckUp(nn.Module):
 
 class LyCodecTransformerLayer(nn.Module):
     """
-    Enhanced transformer layer with psychoacoustic attention and low-rank fusion.
+    Enhanced transformer layer with psychoacoustic Linear Attention and low-rank fusion.
     
     Integrates orthogonal attention matrices, FastRMSNorm2D, and cross-level
-    information flow for production-grade audio modeling.
+    information flow using exclusively Linear Attention for production-grade audio modeling.
     """
     
     def __init__(self, config: LyCodecConfig, layer_idx: int):
@@ -193,12 +194,12 @@ class LyCodecTransformerLayer(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_dim // self.num_heads
         
-        # Enhanced psychoacoustic attention with orthogonal initialization
+        # Enhanced psychoacoustic attention with orthogonal initialization (Linear Attention only)
         self.psycho_attention = PsychoacousticTransform(
             hidden_dim=config.hidden_dim,
             num_heads=config.num_attention_heads,
             psycho_bands=config.psycho_bands,
-            use_linear_attention=True
+            sample_rate=config.sample_rate
         )
         
         # FastRMSNorm2D with cross-platform compatibility
@@ -232,7 +233,7 @@ class LyCodecTransformerLayer(nn.Module):
     
     def forward(self, x: torch.Tensor, cross_level_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass with optional cross-level feature fusion.
+        Forward pass with optional cross-level feature fusion using Linear Attention.
         
         Args:
             x: Input tensor [batch, seq_len, hidden_dim]
@@ -241,7 +242,7 @@ class LyCodecTransformerLayer(nn.Module):
         Returns:
             Transformed tensor with same shape as input
         """
-        # Pre-norm psychoacoustic attention with residual connection
+        # Pre-norm psychoacoustic attention with residual connection (Linear Attention only)
         normed_x = self.attention_norm(x)
         attn_output = self.psycho_attention(normed_x)
         x = x + attn_output
@@ -258,6 +259,31 @@ class LyCodecTransformerLayer(nn.Module):
         x = x + ffn_output
         
         return x
+    
+    def get_attention_info(self) -> Dict[str, Union[str, int, List[str]]]:
+        """
+        Get information about the Linear Attention mechanism used.
+        
+        Returns:
+            Dictionary with attention configuration details
+        """
+        return {
+            'attention_type': 'Linear Attention (Psychoacoustic)',
+            'num_heads': self.num_heads,
+            'head_dim': self.head_dim,
+            'psycho_bands': self.config.psycho_bands,
+            'orthogonal_projections': True,
+            'cross_level_fusion': self.has_fusion,
+            'computational_complexity': 'O(N × D)',  # Linear in sequence length
+            'memory_complexity': 'O(N × D)',
+            'advantages': [
+                'Linear scaling with sequence length',
+                'Psychoacoustic masking integration',
+                'Orthogonal weight initialization',
+                'Cross-channel correlation optimization',
+                'Memory efficient for long audio sequences'
+            ]
+        }
 
 
 class LyCodecEncoder(nn.Module):
@@ -266,6 +292,7 @@ class LyCodecEncoder(nn.Module):
     
     Transforms 44.1kHz stereo audio into quantized latent representations
     through enhanced psychoacoustic transforms and low-rank fusion layers.
+    Uses exclusively Linear Attention for optimal efficiency.
     """
     
     def __init__(self, config: LyCodecConfig):
@@ -288,7 +315,7 @@ class LyCodecEncoder(nn.Module):
             torch.randn(1, frontend_len, config.hidden_dim) * 0.02
         )
         
-        # Transformer layers with cross-level fusion
+        # Transformer layers with cross-level fusion (Linear Attention only)
         self.layers = nn.ModuleList([
             LyCodecTransformerLayer(config, i) for i in range(config.num_layers)
         ])
@@ -312,7 +339,7 @@ class LyCodecEncoder(nn.Module):
     
     def forward(self, audio: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        Encode stereo audio to latent representation.
+        Encode stereo audio to latent representation using Linear Attention.
         
         Args:
             audio: Input tensor [batch, channels=2, samples=220500]
@@ -330,7 +357,7 @@ class LyCodecEncoder(nn.Module):
         # Store intermediate features for cross-level fusion
         layer_features = []
         
-        # Process through transformer layers
+        # Process through transformer layers (Linear Attention only)
         for i, layer in enumerate(self.layers):
             # Determine cross-level features for fusion layers
             cross_level_features = None
@@ -352,7 +379,8 @@ class LyCodecEncoder(nn.Module):
         metadata = {
             'bit_allocation': bit_allocation,
             'complexity_metrics': complexity_metrics,
-            'layer_features': layer_features[-3:]  # Keep last 3 for analysis
+            'layer_features': layer_features[-3:],  # Keep last 3 for analysis
+            'original_length': audio.shape[-1]  # Store original audio length
         }
         
         return latent_features, metadata
@@ -364,6 +392,7 @@ class LyCodecDecoder(nn.Module):
     
     Reconstructs 44.1kHz stereo audio from quantized latent representations
     through harmonic+noise decomposition and high-performance synthesis.
+    Uses exclusively Linear Attention for consistent performance.
     """
     
     def __init__(self, config: LyCodecConfig):
@@ -378,7 +407,7 @@ class LyCodecDecoder(nn.Module):
             rank=config.low_rank_dim
         )
         
-        # Transformer layers for latent processing
+        # Transformer layers for latent processing (Linear Attention only)
         self.layers = nn.ModuleList([
             LyCodecTransformerLayer(config, i) for i in range(config.num_layers)
         ])
@@ -398,7 +427,7 @@ class LyCodecDecoder(nn.Module):
     def forward(self, latent_features: torch.Tensor, 
                 metadata: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Decode latent features to stereo audio.
+        Decode latent features to stereo audio using Linear Attention.
         
         Args:
             latent_features: Quantized features [batch, seq_len, hidden_dim]
@@ -410,7 +439,7 @@ class LyCodecDecoder(nn.Module):
         # Input projection
         x = self.input_projection(latent_features)
         
-        # Process through transformer layers
+        # Process through transformer layers (Linear Attention only)
         for layer in self.layers:
             x = layer(x)
         
@@ -419,6 +448,20 @@ class LyCodecDecoder(nn.Module):
         
         # DDSP vocoder synthesis
         audio = self.vocoder(x, metadata)
+        
+        # Upsample to original length if needed
+        if 'original_length' in metadata:
+            original_length = metadata['original_length']
+            current_length = audio.shape[-1]
+            
+            if current_length != original_length:
+                # Use interpolation to upsample to original length
+                audio = F.interpolate(
+                    audio, 
+                    size=original_length, 
+                    mode='linear', 
+                    align_corners=False
+                )
         
         return audio
 
@@ -429,6 +472,7 @@ class LyCodecModel(nn.Module):
     
     Integrates encoder, continuous bottleneck, and decoder with DDSP vocoder
     for high-quality 44.1kHz stereo audio compression at adaptive bitrates.
+    Uses exclusively Linear Attention throughout the architecture.
     """
     
     def __init__(self, config: LyCodecConfig):
@@ -459,7 +503,7 @@ class LyCodecModel(nn.Module):
     
     def forward(self, audio: torch.Tensor, training: bool = True) -> Dict[str, torch.Tensor]:
         """
-        Full forward pass for training or inference.
+        Full forward pass for training or inference using Linear Attention.
         
         Args:
             audio: Input stereo audio [batch, channels=2, samples=220500]
@@ -561,4 +605,44 @@ class LyCodecModel(nn.Module):
             'parameters_mb': param_size / (1024**2),
             'buffers_mb': buffer_size / (1024**2),
             'total_mb': (param_size + buffer_size) / (1024**2)
+        }
+    
+    def get_architecture_info(self) -> Dict[str, Union[str, int, List[str]]]:
+        """
+        Get comprehensive architecture information emphasizing Linear Attention.
+        
+        Returns:
+            Dictionary with model architecture details
+        """
+        # Get attention info from a sample transformer layer
+        sample_layer_info = self.encoder.layers[0].get_attention_info()
+        
+        return {
+            'model_name': 'LyCodec v2.1',
+            'attention_mechanism': 'Linear Attention (Exclusive)',
+            'total_parameters': self.get_model_size(),
+            'encoder_layers': self.config.num_layers,
+            'decoder_layers': self.config.num_layers,
+            'attention_heads': self.config.num_attention_heads,
+            'hidden_dimension': self.config.hidden_dim,
+            'psychoacoustic_bands': self.config.psycho_bands,
+            'harmonics_count': self.config.harmonics_count,
+            'noise_bands': self.config.noise_bands,
+            'audio_specs': {
+                'sample_rate': self.config.sample_rate,
+                'channels': self.config.channels,
+                'segment_length': self.config.segment_length
+            },
+            'efficiency_features': [
+                'Linear Attention scaling O(N×D)',
+                'Low-rank matrix factorization',
+                'Adaptive bit allocation',
+                'Cross-level feature fusion',
+                'Orthogonal weight initialization',
+                'Memory-efficient bottleneck',
+                'DDSP-based synthesis'
+            ],
+            'attention_advantages': sample_layer_info['advantages'],
+            'memory_optimization': 'V100×4 16GB optimized',
+            'inference_target': '<8GB memory, RTF 0.55'
         }

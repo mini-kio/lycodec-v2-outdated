@@ -376,7 +376,7 @@ class ProductionAdaptiveBitAllocator(nn.Module):
         """
         # Check if allocation exceeds budget
         current_rate = torch.mean(allocation) * self.target_bitrate
-        budget_exceeded = current_rate > self.target_bitrate * 1.1  # 10% tolerance
+        budget_exceeded = current_rate.item() > self.target_bitrate.item() * 1.1  # 10% tolerance
         
         emergency_triggered = False
         
@@ -394,7 +394,7 @@ class ProductionAdaptiveBitAllocator(nn.Module):
             adjusted_allocation = allocation * quality_factor
             
             print(f"Emergency bitrate control activated: "
-                  f"Target rate {current_rate:.1f} -> {torch.mean(adjusted_allocation) * self.target_bitrate:.1f} kbps")
+                  f"Target rate {current_rate.item():.1f} -> {(torch.mean(adjusted_allocation) * self.target_bitrate).item():.1f} kbps")
         else:
             # Normal operation - gradually recover from emergency mode
             if self.emergency_mode.item():
@@ -434,17 +434,21 @@ class ProductionAdaptiveBitAllocator(nn.Module):
             current_allocation = allocation[:, t:t+1]
             current_complexity = complexity[:, t:t+1]
             
+            # Get mean complexity for the current time step
+            mean_complexity = current_complexity.mean().item()
+            
             # Determine if we should borrow or lend bits
-            if current_complexity > 0.7:  # High complexity - may need extra bits
-                if self.bit_credit > 0:
+            if mean_complexity > 0.7:  # High complexity - may need extra bits
+                if self.bit_credit.item() > 0:
                     # Use banked bits
-                    extra_bits = min(self.bit_credit.item(), avg_allocation.item() * 0.2)
-                    banked_allocation[:, t:t+1] += extra_bits / self.target_bitrate
+                    extra_bits = min(self.bit_credit.item(), avg_allocation.mean().item() * 0.2)
+                    banked_allocation[:, t:t+1] += extra_bits / self.target_bitrate.item()
                     self.bit_credit.sub_(extra_bits)
             
-            elif current_complexity < 0.3:  # Low complexity - bank excess bits
+            elif mean_complexity < 0.3:  # Low complexity - bank excess bits
                 excess_bits = (avg_allocation - current_allocation) * 0.5
-                bankable_bits = torch.clamp(excess_bits, 0, self.max_credit - self.bit_credit)
+                max_bankable = max(0.0, self.max_credit - self.bit_credit.item())
+                bankable_bits = torch.clamp(excess_bits, 0.0, max_bankable)
                 
                 banked_allocation[:, t:t+1] -= bankable_bits
                 self.bit_credit.add_(bankable_bits.sum().item())
@@ -498,7 +502,7 @@ class ProductionAdaptiveBitAllocator(nn.Module):
         
         # Check for overflow (simplified check)
         current_rate = torch.mean(final_allocation) * self.target_bitrate
-        if current_rate > self.target_bitrate * 1.15:  # 15% over budget
+        if current_rate.item() > self.target_bitrate.item() * 1.15:  # 15% over budget
             self.overflow_count.add_(1)
         
         # Compute compression estimate

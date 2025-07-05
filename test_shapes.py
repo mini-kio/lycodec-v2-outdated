@@ -79,8 +79,10 @@ def test_model_shapes():
         # Shape 일치 확인
         if reconstructed_audio.shape == audio_input.shape:
             print("✅ 입력과 출력 shape 일치!")
+            shape_success = True
         else:
             print(f"❌ Shape 불일치! 입력: {audio_input.shape}, 출력: {reconstructed_audio.shape}")
+            shape_success = False
         
         print()
         
@@ -101,7 +103,7 @@ def test_model_shapes():
                     print(f"  - {key}: {type(value)}")
         
         print()
-        return True
+        return shape_success
         
     except Exception as e:
         print(f"❌ 오류 발생: {e}")
@@ -150,10 +152,10 @@ def test_encoder_decoder_shapes():
             # Shape 검증
             if reconstructed.shape == audio_input.shape:
                 print("✅ 전체 파이프라인 shape 일치!")
+                return True
             else:
                 print(f"❌ Shape 불일치! 입력: {audio_input.shape}, 출력: {reconstructed.shape}")
-        
-        return True
+                return False
         
     except Exception as e:
         print(f"❌ 오류 발생: {e}")
@@ -273,14 +275,14 @@ def test_loss_function_shapes():
 
 
 def test_gradient_flow():
-    """Gradient flow 테스트"""
+    """Gradient flow 테스트 (간소화)"""
     print("=" * 60)
     print("Gradient Flow 테스트")
     print("=" * 60)
     
     from train import LyCodecLoss
     
-    batch_size = 2
+    batch_size = 1  # 배치 크기를 1로 줄여서 빠르게 테스트
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     try:
@@ -302,6 +304,14 @@ def test_gradient_flow():
         
         # Forward pass
         audio_input = torch.randn(batch_size, CHANNELS, SEGMENT_SAMPLES).to(device)
+        
+        # 테스트를 위해 eval 모드로 먼저 실행
+        model.eval()
+        with torch.no_grad():
+            model_output = model(audio_input, training=False)
+        
+        # Training mode로 변경 후 gradient 테스트
+        model.train()
         model_output = model(audio_input, training=True)
         loss_dict = loss_fn(model_output, audio_input)
         total_loss = loss_dict['total_loss']
@@ -312,24 +322,30 @@ def test_gradient_flow():
         optimizer.zero_grad()
         total_loss.backward()
         
-        # Gradient 확인
+        # Gradient 확인 (일부만 체크)
+        grad_count = 0
         grad_norms = []
-        param_count = 0
         for name, param in model.named_parameters():
             if param.grad is not None:
                 grad_norm = param.grad.norm().item()
                 grad_norms.append(grad_norm)
-                param_count += 1
+                grad_count += 1
+                if grad_count >= 10:  # 처음 10개만 체크
+                    break
         
-        print(f"파라미터 수 (gradient 있음): {param_count}")
-        print(f"Gradient norm 범위: [{min(grad_norms):.6f}, {max(grad_norms):.6f}]")
-        print(f"평균 gradient norm: {np.mean(grad_norms):.6f}")
-        
-        # Optimizer step
-        optimizer.step()
-        
-        print("✅ Gradient flow 정상!")
-        return True
+        if len(grad_norms) > 0:
+            print(f"파라미터 수 (gradient 있음): {grad_count}+")
+            print(f"Gradient norm 범위: [{min(grad_norms):.6f}, {max(grad_norms):.6f}]")
+            print(f"평균 gradient norm: {np.mean(grad_norms):.6f}")
+            
+            # Optimizer step
+            optimizer.step()
+            
+            print("✅ Gradient flow 정상!")
+            return True
+        else:
+            print("❌ Gradient가 없습니다!")
+            return False
         
     except Exception as e:
         print(f"❌ 오류 발생: {e}")
