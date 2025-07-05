@@ -13,7 +13,16 @@ v0.1.3 Major Features:
 
 from .inference import LyCodec
 from .models import LyEncoder, LyDecoder, PsychoacousticTransform, LinearAttention
-from .audio import gammatone_filterbank, psychoacoustic_masking, high_quality_resample, to_magnitude_phase, from_magnitude_phase
+from .audio import (
+    gammatone_filterbank, 
+    psychoacoustic_masking, 
+    high_quality_resample, 
+    to_magnitude_phase, 
+    from_magnitude_phase,
+    to_complex_spec,
+    to_waveform,
+    normalize_audio
+)
 from .training import LyCodecTrainer
 from .streaming import StreamingDecoder, create_streaming_decoder
 
@@ -32,6 +41,9 @@ __all__ = [
     'gammatone_filterbank',
     'psychoacoustic_masking',
     'high_quality_resample',
-    'to_magnitude_phase',  # Now exposed in public API
-    'from_magnitude_phase'  # Now exposed in public API
+    'to_magnitude_phase',
+    'from_magnitude_phase',
+    'to_complex_spec',
+    'to_waveform',
+    'normalize_audio'
 ]

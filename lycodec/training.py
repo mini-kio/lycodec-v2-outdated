@@ -11,7 +11,12 @@ import logging
 from pathlib import Path
 
 from .models import LyCodecModel
-from .audio import SpectralLoss, to_complex_spec, to_magnitude_phase, from_magnitude_phase, to_waveform
+from .audio import (
+    SpectralLoss, 
+    to_complex_spec, 
+    to_magnitude_phase, 
+    to_waveform
+)
 
 class LyCodecTrainer:
     """

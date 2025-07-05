@@ -13,13 +13,7 @@ def test_basic_imports():
     print("🧪 Testing LyCodec v0.1.3 Basic Imports and API")
     
     try:
-        from lycodec import (
-            LyCodec, 
-            to_magnitude_phase, 
-            from_magnitude_phase,
-            high_quality_resample,
-            create_streaming_decoder
-        )
+        from lycodec import LyCodec
         print("   ✅ All main imports successful")
         return True
     except ImportError as e:

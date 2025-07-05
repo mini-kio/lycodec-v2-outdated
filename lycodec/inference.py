@@ -1,5 +1,4 @@
 import torch
-import torch.nn.functional as F
 import numpy as np
 import soundfile as sf
 from pathlib import Path
@@ -9,8 +8,12 @@ from contextlib import contextmanager
 
 from .models import LyCodecModel
 from .audio import (
-    to_complex_spec, to_magnitude_phase, from_magnitude_phase, 
-    to_waveform, normalize_audio, SAMPLE_RATE, HOP_LENGTH
+    to_complex_spec, 
+    to_waveform, 
+    normalize_audio, 
+    SAMPLE_RATE, 
+    HOP_LENGTH, 
+    N_FFT
 )
 
 class LyCodec:
@@ -359,8 +362,19 @@ class LyCodec:
             latent_tensor = latent_tensor.half()
         
         with self._memory_efficient_inference():
-            # Decode
-            real_part, imag_part = self.model.decode(latent_tensor)
+            # IMPROVED: Calculate correct target size for ISTFT compatibility
+            # For center=False STFT with n_fft=2048, we need 1025 frequency bins (n_fft//2 + 1)
+            target_freq_bins = N_FFT // 2 + 1  # 1025 for n_fft=2048
+            
+            # Estimate time dimension from target_length if provided
+            if target_length is not None:
+                target_time_bins = (target_length // HOP_LENGTH) + 1
+                target_size = (target_freq_bins, target_time_bins)
+            else:
+                target_size = (target_freq_bins, None)  # Let decoder determine time dimension
+            
+            # Decode with correct target size
+            real_part, imag_part = self.model.decode(latent_tensor, target_size)
             
             # Reconstruct complex spectrogram
             complex_spec = torch.complex(real_part, imag_part)  # [B, 2, F, T]

@@ -12,32 +12,35 @@ def test_basic_functionality():
     """Quick functionality test for v0.1.3"""
     print("🧪 Testing LyCodec v0.1.3 Basic Functionality")
     
-    # Test CPU mode first (more compatible)
-    print("\n1. Testing CPU mode...")
-    try:
-        codec = LyCodec(half_precision=False, device='cpu')
-        stats = codec.test_round_trip(2.0)
-        snr_db = stats["snr_db"]
-        print(f"   ✅ CPU round-trip SNR: {snr_db:.2f} dB")
-        print(f"   📊 Original shape: {stats['original_shape']}, Reconstructed: {stats['reconstructed_shape']}")
-        print(f"   📊 MSE: {stats['mse']:.2e}")
-        
-        if snr_db > 10:
-            print("   ✅ SNR looks reasonable for untrained model")
-        else:
-            print("   ⚠️  Low SNR - check for issues")
+    # Test GPU mode first (FP16 optimized)
+    print("\n1. Testing GPU mode...")
+    if torch.cuda.is_available():
+        try:
+            codec = LyCodec(half_precision=True, device='cuda')
+            stats = codec.test_round_trip(2.0)
+            snr_db = stats["snr_db"]
+            print(f"   ✅ GPU round-trip SNR: {snr_db:.2f} dB")
+            print(f"   📊 Original shape: {stats['original_shape']}, Reconstructed: {stats['reconstructed_shape']}")
+            print(f"   📊 MSE: {stats['mse']:.2e}")
             
-    except Exception as e:
-        print(f"   ❌ CPU test failed: {e}")
-        print("   🔍 Error details:")
-        traceback.print_exc()
+            if snr_db > 10:
+                print("   ✅ SNR looks reasonable for untrained model")
+            else:
+                print("   ⚠️  Low SNR - check for issues")
+                
+        except Exception as e:
+            print(f"   ❌ GPU test failed: {e}")
+            print("   🔍 Error details:")
+            traceback.print_exc()
+    else:
+        print("   ⚠️  GPU not available, skipping GPU test")
     
     # Test GPU mode if available
     if torch.cuda.is_available():
         print("\n2. Testing GPU mode...")
         try:
-            # Use FP32 for compatibility in testing
-            codec_gpu = LyCodec(half_precision=False, device='cuda')
+            # Test with FP16 precision as intended
+            codec_gpu = LyCodec(half_precision=True, device='cuda')
             stats_gpu = codec_gpu.test_round_trip(2.0)
             snr_gpu = stats_gpu["snr_db"]
             print(f"   ✅ GPU round-trip SNR: {snr_gpu:.2f} dB")

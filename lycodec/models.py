@@ -319,10 +319,20 @@ class LyDecoder(nn.Module):
         real_part = real_imag[:, :, 0]  # [B, out_channels, F, T]
         imag_part = real_imag[:, :, 1]  # [B, out_channels, F, T]
         
-        # Resize to target if specified
+        # Resize to target if specified - IMPROVED: Handle partial target_size
         if target_size is not None:
-            real_part = F.interpolate(real_part, size=target_size, mode='bilinear', align_corners=False)
-            imag_part = F.interpolate(imag_part, size=target_size, mode='bilinear', align_corners=False)
+            target_f, target_t = target_size
+            
+            # If only frequency is specified, keep original time dimension
+            if target_t is None:
+                target_t = real_part.shape[-1]
+            
+            # Ensure we have valid dimensions
+            if target_f > 0 and target_t > 0:
+                # Use torch.nn.functional explicitly to avoid variable name conflicts
+                import torch.nn.functional as TF
+                real_part = TF.interpolate(real_part, size=(target_f, target_t), mode='bilinear', align_corners=False)
+                imag_part = TF.interpolate(imag_part, size=(target_f, target_t), mode='bilinear', align_corners=False)
         
         return real_part, imag_part
 

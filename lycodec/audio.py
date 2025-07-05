@@ -60,21 +60,58 @@ def istft_transform(stft_tensor, n_fft=N_FFT, hop_length=HOP_LENGTH, window='han
     Args:
         length: Expected output length for exact reconstruction
     """
+    # IMPROVED: Handle ComplexHalf compatibility - convert to Float32 for ISTFT
+    original_dtype = stft_tensor.dtype
+    if stft_tensor.dtype == torch.complex32:  # ComplexHalf
+        stft_tensor = stft_tensor.to(torch.complex64)  # ComplexFloat
+        precision_converted = True
+    else:
+        precision_converted = False
+    
     if stft_tensor.device.type == 'cuda':
         window_fn = torch.hann_window(n_fft, device=stft_tensor.device)
     else:
         window_fn = torch.hann_window(n_fft)
-        
-    waveform = torch.istft(
-        stft_tensor,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        window=window_fn,
-        normalized=False,
-        onesided=True,
-        center=False,  # IMPROVED: Fixed center=False for streaming consistency
-        length=length   # IMPROVED: Pass length to ensure exact reconstruction
-    )
+    
+    # Ensure window has same precision as input
+    if precision_converted:
+        window_fn = window_fn.float()
+    elif stft_tensor.dtype == torch.complex128:
+        window_fn = window_fn.double()
+    
+    try:
+        # Try with center=False first (streaming optimized)
+        waveform = torch.istft(
+            stft_tensor,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window_fn,
+            normalized=False,
+            onesided=True,
+            center=False,  # IMPROVED: Fixed center=False for streaming consistency
+            length=length   # IMPROVED: Pass length to ensure exact reconstruction
+        )
+    except RuntimeError as e:
+        if "window overlap add min" in str(e):
+            # Fallback to center=True for compatibility
+            warnings.warn("ISTFT with center=False failed, falling back to center=True", UserWarning)
+            waveform = torch.istft(
+                stft_tensor,
+                n_fft=n_fft,
+                hop_length=hop_length,
+                window=window_fn,
+                normalized=False,
+                onesided=True,
+                center=True,  # Fallback for compatibility
+                length=length
+            )
+        else:
+            raise e
+    
+    # Convert back to original precision if needed
+    if precision_converted and original_dtype == torch.complex32:
+        waveform = waveform.half()
+    
     return waveform
 
 def high_quality_resample(audio, orig_sr, target_sr):
@@ -222,26 +259,43 @@ class GammatoneFilterbank(nn.Module):
         """
         B, F, T = magnitude_spectrum.shape
         
-        # Create frequency grid
-        freq_grid = torch.linspace(0, self.sample_rate // 2, F, device=magnitude_spectrum.device)
+        # Create frequency grid - IMPROVED: Match input dtype and device for FP16 compatibility
+        freq_grid = torch.linspace(
+            0, self.sample_rate // 2, F, 
+            device=magnitude_spectrum.device,
+            dtype=magnitude_spectrum.dtype  # Match input precision
+        )
+        
+        # Ensure center_freqs and erb_widths match input precision
+        center_freqs = self.center_freqs.to(magnitude_spectrum.dtype)
+        erb_widths = self.erb_widths.to(magnitude_spectrum.dtype)
         
         # Vectorized gammatone responses computation
         # [F, 1] - [1, n_filters] = [F, n_filters]
-        freq_diff = freq_grid.unsqueeze(1) - self.center_freqs.unsqueeze(0)
+        freq_diff = freq_grid.unsqueeze(1) - center_freqs.unsqueeze(0)
         
         # Gammatone filter responses (simplified but vectorized)
-        responses = torch.exp(-2 * math.pi * self.erb_widths.unsqueeze(0) * 
-                            torch.abs(freq_diff) / self.sample_rate)  # [F, n_filters]
+        # IMPROVED: Ensure all operations use same precision
+        sample_rate_tensor = torch.tensor(
+            self.sample_rate, 
+            device=magnitude_spectrum.device,
+            dtype=magnitude_spectrum.dtype
+        )
+        responses = torch.exp(-2 * math.pi * erb_widths.unsqueeze(0) * 
+                            torch.abs(freq_diff) / sample_rate_tensor)  # [F, n_filters]
         
         # Apply filters: [B, F, T] @ [F, n_filters] -> [B, n_filters, T]
-        # Use einsum for efficient computation
-        filtered_output = torch.einsum('bft,fn->bnt', magnitude_spectrum, responses)
+        # IMPROVED: Use torch.matmul instead of einsum for better FP16 compatibility
+        # Reshape for matrix multiplication: [B*T, F] @ [F, n_filters] = [B*T, n_filters]
+        magnitude_reshaped = magnitude_spectrum.permute(0, 2, 1).contiguous().view(-1, F)  # [B*T, F]
+        filtered_reshaped = torch.matmul(magnitude_reshaped, responses)  # [B*T, n_filters]
+        filtered_output = filtered_reshaped.view(B, T, self.n_filters).permute(0, 2, 1)  # [B, n_filters, T]
         
         return filtered_output
 
 def psychoacoustic_masking(gammatone_output, threshold_db=-60):
     """
-    Compute psychoacoustic masking curve - IMPROVED
+    Compute psychoacoustic masking curve - IMPROVED with FP16 compatibility
     Args:
         gammatone_output: [B, n_filters, T] - gammatone filterbank output
         threshold_db: absolute hearing threshold
@@ -254,13 +308,16 @@ def psychoacoustic_masking(gammatone_output, threshold_db=-60):
     
     n_filters = gammatone_output.shape[1]
     device = gammatone_output.device
+    dtype = gammatone_output.dtype  # IMPROVED: Preserve input dtype
     
     # Precompute spreading matrix if not cached
+    cache_key = (n_filters, dtype)
     if (not hasattr(psychoacoustic_masking, '_spreading_cache') or 
         psychoacoustic_masking._spreading_cache is None or
-        psychoacoustic_masking._spreading_cache[0] != n_filters):
+        psychoacoustic_masking._spreading_cache[0] != cache_key):
         
-        spreading_matrix = torch.zeros(n_filters, n_filters, device=device)
+        # IMPROVED: Create spreading matrix with correct dtype
+        spreading_matrix = torch.zeros(n_filters, n_filters, device=device, dtype=dtype)
         
         for i in range(n_filters):
             for j in range(n_filters):
@@ -273,15 +330,19 @@ def psychoacoustic_masking(gammatone_output, threshold_db=-60):
                     spreading_matrix[i, j] = 1.0
         
         # Cache for reuse
-        psychoacoustic_masking._spreading_cache = (n_filters, spreading_matrix.cpu())
+        psychoacoustic_masking._spreading_cache = (cache_key, spreading_matrix.cpu())
     
-    spreading_matrix = psychoacoustic_masking._spreading_cache[1].to(device)
+    spreading_matrix = psychoacoustic_masking._spreading_cache[1].to(device=device, dtype=dtype)
     
-    # Apply spreading: [n_filters, n_filters] @ [B, n_filters, T] -> [B, n_filters, T]
-    spread_power = torch.einsum('fn,bnt->bnt', spreading_matrix, power_db)
+    # IMPROVED: Use torch.matmul instead of einsum for better FP16 compatibility
+    # Apply spreading: [B, n_filters, T] -> [B*T, n_filters] @ [n_filters, n_filters] -> [B*T, n_filters] -> [B, n_filters, T]
+    B, n_filters, T = power_db.shape
+    power_reshaped = power_db.permute(0, 2, 1).contiguous().view(-1, n_filters)  # [B*T, n_filters]
+    spread_reshaped = torch.matmul(power_reshaped, spreading_matrix.T)  # [B*T, n_filters]
+    spread_power = spread_reshaped.view(B, T, n_filters).permute(0, 2, 1)  # [B, n_filters, T]
     
     # Apply absolute threshold
-    abs_threshold = torch.full_like(spread_power, threshold_db)
+    abs_threshold = torch.full_like(spread_power, threshold_db, dtype=dtype)
     masking_curve = torch.maximum(spread_power, abs_threshold)
     
     return masking_curve
