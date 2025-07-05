@@ -1,10 +1,10 @@
 """
-LyCodec v2.1 Training Script
-============================
+LyCodec v2.1 Training Script with WandB Integration
+==================================================
 
 Production-grade training pipeline for 44.1kHz stereo audio codec with
-V100×4 16GB optimization, 5-second segment processing, and adaptive
-bit allocation learning.
+V100×4 16GB optimization, 5-second segment processing, adaptive
+bit allocation learning, and comprehensive monitoring.
 """
 
 import torch
@@ -24,6 +24,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 from tqdm import tqdm
+
+# WandB integration
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available. Install with 'pip install wandb' for experiment tracking.")
 
 # Import LyCodec components
 from lycodec import (
@@ -167,7 +175,7 @@ class LyCodecDataset(Dataset):
 
 class LyCodecLoss(nn.Module):
     """
-    Comprehensive loss function for LyCodec training.
+    Comprehensive loss function for LyCodec training with fixed bitrate efficiency calculation.
     
     Combines reconstruction loss, perceptual loss, and bit allocation
     efficiency for high-quality codec optimization.
@@ -181,38 +189,51 @@ class LyCodecLoss(nn.Module):
         self.perceptual_weight = config.get('perceptual_weight', 0.1)
         self.bitrate_weight = config.get('bitrate_weight', 0.01)
         
-        # Perceptual loss (simplified spectral loss)
-        self.stft_config = {
-            'n_fft': 2048,
-            'hop_length': 512,
-            'win_length': 2048,
-            'window': 'hann'
-        }
-        
-        # Multi-scale STFT losses
+        # Multi-scale STFT losses with cached windows for performance
         self.stft_scales = [
             {'n_fft': 2048, 'hop_length': 512},
             {'n_fft': 1024, 'hop_length': 256},
             {'n_fft': 512, 'hop_length': 128}
         ]
+        
+        # Pre-cache Hann windows to avoid repeated computation
+        for scale in self.stft_scales:
+            n_fft = scale['n_fft']
+            window_name = f'hann_window_{n_fft}'
+            self.register_buffer(window_name, torch.hann_window(n_fft))
+    
+    def _get_cached_window(self, n_fft: int, device: torch.device) -> torch.Tensor:
+        """Get cached Hann window for given n_fft size."""
+        window_name = f'hann_window_{n_fft}'
+        window = getattr(self, window_name)
+        if window.device != device:
+            window = window.to(device)
+            setattr(self, window_name, window)
+        return window
     
     def _compute_stft_loss(self, predicted: torch.Tensor, 
                           target: torch.Tensor, stft_params: Dict) -> torch.Tensor:
-        """Compute STFT-based spectral loss."""
+        """Compute STFT-based spectral loss with cached windows for performance."""
+        n_fft = stft_params['n_fft']
+        hop_length = stft_params['hop_length']
+        
+        # Get cached window
+        window = self._get_cached_window(n_fft, predicted.device)
+        
         # Compute STFT for both signals
         pred_stft = torch.stft(
             predicted.view(-1, predicted.shape[-1]),
-            n_fft=stft_params['n_fft'],
-            hop_length=stft_params['hop_length'],
-            window=torch.hann_window(stft_params['n_fft'], device=predicted.device),
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window,
             return_complex=True
         )
         
         target_stft = torch.stft(
             target.view(-1, target.shape[-1]),
-            n_fft=stft_params['n_fft'],
-            hop_length=stft_params['hop_length'],
-            window=torch.hann_window(stft_params['n_fft'], device=target.device),
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window,
             return_complex=True
         )
         
@@ -243,26 +264,43 @@ class LyCodecLoss(nn.Module):
         return total_loss / len(self.stft_scales)
     
     def _compute_bitrate_efficiency_loss(self, metadata: Dict) -> torch.Tensor:
-        """Compute bitrate efficiency regularization."""
+        """
+        Compute bitrate efficiency regularization with proper tensor handling.
+        
+        Fixed to handle type mismatches and device issues.
+        """
+        # Determine device from available tensors in metadata
+        device = torch.device('cpu')
+        for value in metadata.values():
+            if isinstance(value, torch.Tensor):
+                device = value.device
+                break
+        
+        # Return zero tensor if no bit allocation information
         if 'bit_allocation' not in metadata:
-            return torch.tensor(0.0, device=next(iter(metadata.values())).device)
+            return torch.tensor(0.0, device=device)
         
         bit_allocation = metadata['bit_allocation']
         
         # Encourage smooth bit allocation (reduce variance)
-        allocation_variance = torch.var(bit_allocation, dim=1)
-        smoothness_loss = torch.mean(allocation_variance)
+        if isinstance(bit_allocation, torch.Tensor) and bit_allocation.numel() > 1:
+            allocation_variance = torch.var(bit_allocation, dim=1) if bit_allocation.dim() > 1 else torch.var(bit_allocation)
+            smoothness_loss = torch.mean(allocation_variance)
+        else:
+            smoothness_loss = torch.tensor(0.0, device=device)
         
         # Encourage efficient bitrate usage
+        overage_loss = torch.tensor(0.0, device=device)
         if 'current_bitrate' in metadata and 'target_bitrate' in metadata:
-            current_bitrate = metadata['current_bitrate']
-            target_bitrate = metadata['target_bitrate']
+            # Convert to tensors and ensure they're on the correct device
+            current_bitrate = torch.tensor(metadata['current_bitrate'], device=device, dtype=torch.float32)
+            target_bitrate = torch.tensor(metadata['target_bitrate'], device=device, dtype=torch.float32)
             
-            # Penalize excessive bitrate usage
-            overage_loss = F.relu(current_bitrate - target_bitrate * 1.1)
-            efficiency_loss = smoothness_loss + overage_loss
-        else:
-            efficiency_loss = smoothness_loss
+            # Penalize excessive bitrate usage (detach to avoid unnecessary gradients)
+            overage = F.relu(current_bitrate - target_bitrate * 1.1).detach()
+            overage_loss = overage * 0.1  # Small weight for overage penalty
+        
+        efficiency_loss = smoothness_loss + overage_loss
         
         return efficiency_loss
     
@@ -286,7 +324,7 @@ class LyCodecLoss(nn.Module):
         # 2. Perceptual loss (frequency domain)
         perceptual_loss = self._compute_perceptual_loss(reconstructed_audio, target_audio)
         
-        # 3. Bitrate efficiency loss
+        # 3. Bitrate efficiency loss (fixed)
         bitrate_loss = self._compute_bitrate_efficiency_loss(metadata)
         
         # 4. Total loss
@@ -306,7 +344,7 @@ class LyCodecLoss(nn.Module):
 
 class LyCodecTrainer:
     """
-    Production-grade trainer for LyCodec with distributed training support.
+    Production-grade trainer for LyCodec with distributed training support and WandB integration.
     
     Implements V100×4 16GB optimization, stable checkpointing, adaptive
     gradient clipping, and comprehensive monitoring for robust training.
@@ -323,12 +361,28 @@ class LyCodecTrainer:
         if self.distributed:
             self._setup_distributed()
         
+        # WandB initialization (only on main process)
+        self.use_wandb = (WANDB_AVAILABLE and 
+                         config.get('wandb', {}).get('enabled', False) and 
+                         device_id == 0)
+        
+        if self.use_wandb:
+            self._setup_wandb()
+        
         # Model configuration
         self.model_config = LyCodecConfig()
         self._update_config_from_yaml()
         
         # Initialize model
         self.model = LyCodecModel(self.model_config).to(self.device)
+        
+        # Log model architecture to WandB
+        if self.use_wandb:
+            wandb.watch(self.model, log_freq=100)
+            wandb.log({
+                "model/total_parameters": self.model.get_model_size(),
+                "model/memory_usage_mb": self.model.get_memory_usage()['total_mb']
+            })
         
         # Wrap model for distributed training
         if self.distributed:
@@ -354,8 +408,8 @@ class LyCodecTrainer:
             max_checkpoints=config['training'].get('max_checkpoints', 5)
         )
         
-        # Monitoring
-        if device_id == 0:  # Only on main process
+        # TensorBoard monitoring (if enabled)
+        if device_id == 0 and config.get('tensorboard', {}).get('enabled', True):
             self.writer = SummaryWriter(
                 log_dir=config['training'].get('log_dir', 'logs')
             )
@@ -380,6 +434,51 @@ class LyCodecTrainer:
             'memory_usage': [],
             'throughput': []
         }
+    
+    def _setup_wandb(self):
+        """Initialize WandB logging."""
+        wandb_config = self.config.get('wandb', {})
+        
+        # Extract key configuration for WandB
+        wandb_log_config = {
+            # Model architecture
+            'model_hidden_dim': self.config['model'].get('hidden_dim', 512),
+            'model_num_layers': self.config['model'].get('num_layers', 8),
+            'model_attention_heads': self.config['model'].get('num_attention_heads', 8),
+            'model_harmonics_count': self.config['model'].get('harmonics_count', 48),
+            
+            # Training settings
+            'batch_size': self.config['data']['batch_size'],
+            'learning_rate': self.config['training']['optimizer']['learning_rate'],
+            'num_epochs': self.config['training']['num_epochs'],
+            'sample_rate': SAMPLE_RATE,
+            'segment_length': SEGMENT_LENGTH,
+            
+            # Loss weights
+            'reconstruction_weight': self.config['loss'].get('reconstruction_weight', 1.0),
+            'perceptual_weight': self.config['loss'].get('perceptual_weight', 0.1),
+            'bitrate_weight': self.config['loss'].get('bitrate_weight', 0.01),
+            
+            # Hardware
+            'world_size': self.world_size,
+            'mixed_precision': self.mixed_precision,
+            'gradient_checkpointing': self.gradient_checkpointing,
+        }
+        
+        wandb.init(
+            project=wandb_config.get('project', 'lycodec-v2.1'),
+            name=wandb_config.get('run_name', None),
+            config=wandb_log_config,
+            tags=wandb_config.get('tags', ['audio-codec', 'ddsp', 'transformer']),
+            notes=wandb_config.get('notes', 'LyCodec v2.1 training with Linear Attention'),
+            group=wandb_config.get('group', None),
+            job_type=wandb_config.get('job_type', 'train'),
+            resume=wandb_config.get('resume', False)
+        )
+        
+        # Log configuration file
+        if 'config_path' in wandb_config:
+            wandb.save(wandb_config['config_path'])
     
     def _setup_distributed(self):
         """Initialize distributed training."""
@@ -530,12 +629,12 @@ class LyCodecTrainer:
         step_stats.update({f'memory_{k}': v for k, v in memory_stats.items()})
         
         # Add model-specific metrics
-        if 'metadata' in model_output:
+        if 'metadata' in model_output and isinstance(model_output['metadata'], dict):
             metadata = model_output['metadata']
             if 'current_bitrate' in metadata:
-                step_stats['current_bitrate'] = metadata['current_bitrate']
+                step_stats['current_bitrate'] = float(metadata['current_bitrate'])
             if 'overflow_rate' in metadata:
-                step_stats['overflow_rate'] = metadata['overflow_rate']
+                step_stats['overflow_rate'] = float(metadata['overflow_rate'])
         
         return step_stats
     
@@ -543,6 +642,7 @@ class LyCodecTrainer:
         """Run validation loop."""
         self.model.eval()
         val_losses = []
+        val_components = {'reconstruction': [], 'perceptual': [], 'bitrate': []}
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validation", disable=self.device_id != 0):
@@ -558,10 +658,37 @@ class LyCodecTrainer:
                     loss_dict = self.loss_fn(model_output, audio)
                 
                 val_losses.append(loss_dict['total_loss'].item())
+                val_components['reconstruction'].append(loss_dict['reconstruction_loss'].item())
+                val_components['perceptual'].append(loss_dict['perceptual_loss'].item())
+                val_components['bitrate'].append(loss_dict['bitrate_loss'].item())
         
+        # Compute averages
         avg_val_loss = sum(val_losses) / len(val_losses)
+        avg_components = {f'val_{k}_loss': sum(v) / len(v) for k, v in val_components.items()}
         
-        return {'val_loss': avg_val_loss}
+        return {'val_loss': avg_val_loss, **avg_components}
+    
+    def _log_metrics(self, metrics: Dict[str, float], step: Optional[int] = None, prefix: str = ""):
+        """Log metrics to both TensorBoard and WandB."""
+        if step is None:
+            step = self.step
+        
+        # TensorBoard logging
+        if self.writer:
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    self.writer.add_scalar(f'{prefix}{key}' if prefix else key, value, step)
+        
+        # WandB logging
+        if self.use_wandb:
+            wandb_metrics = {}
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)):
+                    metric_name = f'{prefix}{key}' if prefix else key
+                    wandb_metrics[metric_name] = value
+            
+            if wandb_metrics:
+                wandb.log(wandb_metrics, step=step)
     
     def train_epoch(self, train_loader: DataLoader, 
                    val_loader: Optional[DataLoader] = None) -> Dict[str, float]:
@@ -587,10 +714,9 @@ class LyCodecTrainer:
                     'mem': f"{step_stats.get('memory_allocated_gb', 0):.1f}GB"
                 })
             
-            # Log to tensorboard
-            if self.writer and self.step % self.config['training']['log_interval'] == 0:
-                for key, value in step_stats.items():
-                    self.writer.add_scalar(f'train/{key}', value, self.step)
+            # Log to monitoring systems
+            if self.step % self.config['training']['log_interval'] == 0:
+                self._log_metrics(step_stats, prefix='train/')
             
             # Checkpoint saving
             if (self.device_id == 0 and 
@@ -626,7 +752,10 @@ class LyCodecTrainer:
             val_stats = self.validate(val_loader)
             epoch_avg.update(val_stats)
             
-            # Update best loss
+            # Log validation metrics
+            self._log_metrics(val_stats, step=self.epoch, prefix='epoch/')
+            
+            # Update best loss and save best model
             if val_stats['val_loss'] < self.best_loss:
                 self.best_loss = val_stats['val_loss']
                 
@@ -641,8 +770,17 @@ class LyCodecTrainer:
                     'config': self.config
                 }
                 
-                torch.save(best_checkpoint_state, 
-                          Path(self.config['training']['checkpoint_dir']) / 'best_model.pt')
+                best_model_path = Path(self.config['training']['checkpoint_dir']) / 'best_model.pt'
+                torch.save(best_checkpoint_state, best_model_path)
+                
+                # Log best model to WandB
+                if self.use_wandb:
+                    wandb.log({'best_val_loss': self.best_loss}, step=self.epoch)
+                    
+                    # Save model artifact
+                    artifact = wandb.Artifact(f'model_epoch_{self.epoch}', type='model')
+                    artifact.add_file(str(best_model_path))
+                    wandb.log_artifact(artifact)
         
         self.epoch += 1
         return epoch_avg
@@ -654,28 +792,41 @@ class LyCodecTrainer:
             print(f"Starting training for {num_epochs} epochs")
             print(f"Model parameters: {self.model.get_model_size():,}")
             print(f"Memory usage: {self.model.get_memory_usage()}")
+            if self.use_wandb:
+                print(f"WandB run: {wandb.run.url}")
         
-        for epoch in range(num_epochs):
-            # Set epoch for distributed sampler
-            if self.distributed and hasattr(train_loader.sampler, 'set_epoch'):
-                train_loader.sampler.set_epoch(epoch)
-            
-            epoch_stats = self.train_epoch(train_loader, val_loader)
-            
-            # Log epoch results
-            if self.device_id == 0:
-                print(f"Epoch {epoch} completed:")
-                for key, value in epoch_stats.items():
-                    print(f"  {key}: {value:.4f}")
+        try:
+            for epoch in range(num_epochs):
+                # Set epoch for distributed sampler
+                if self.distributed and hasattr(train_loader.sampler, 'set_epoch'):
+                    train_loader.sampler.set_epoch(epoch)
                 
-                # Log to tensorboard
-                if self.writer:
+                epoch_stats = self.train_epoch(train_loader, val_loader)
+                
+                # Log epoch results
+                if self.device_id == 0:
+                    print(f"Epoch {epoch} completed:")
                     for key, value in epoch_stats.items():
-                        self.writer.add_scalar(f'epoch/{key}', value, epoch)
+                        print(f"  {key}: {value:.4f}")
+                    
+                    # Log epoch summary to monitoring systems
+                    self._log_metrics(epoch_stats, step=epoch, prefix='epoch/')
         
-        if self.device_id == 0:
-            print("Training completed!")
-            self.writer.close()
+        except KeyboardInterrupt:
+            if self.device_id == 0:
+                print("Training interrupted by user")
+        except Exception as e:
+            if self.device_id == 0:
+                print(f"Training failed with error: {e}")
+            raise
+        finally:
+            # Cleanup
+            if self.device_id == 0:
+                print("Training completed!")
+                if self.writer:
+                    self.writer.close()
+                if self.use_wandb:
+                    wandb.finish()
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load checkpoint and resume training."""
@@ -762,7 +913,7 @@ def create_data_loaders(config: Dict, world_size: int = 1,
 
 
 def main():
-    parser = argparse.ArgumentParser(description='LyCodec v2.1 Training')
+    parser = argparse.ArgumentParser(description='LyCodec v2.1 Training with WandB Integration')
     parser.add_argument('--config', type=str, required=True,
                        help='Path to configuration file')
     parser.add_argument('--resume', type=str, default=None,
@@ -775,6 +926,11 @@ def main():
     # Load configuration
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # Add config path for WandB artifact saving
+    if 'wandb' not in config:
+        config['wandb'] = {}
+    config['wandb']['config_path'] = args.config
     
     # Setup distributed training
     world_size = int(os.environ.get('WORLD_SIZE', 1))

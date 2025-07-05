@@ -274,3 +274,25 @@ paths:
   export_dir: "exports"
   onnx_dir: "exports/onnx"
   torchscript_dir: "exports/torchscript"
+
+# Monitoring and logging configuration
+wandb:
+  # WandB experiment tracking
+  enabled: true                    # Set to false to disable WandB
+  project: "lycodec-v2.1"         # WandB project name
+  run_name: null                   # Auto-generated if null
+  group: "production-training"     # Group related runs
+  job_type: "train"               # Job type for organization
+  tags: ["audio-codec", "ddsp", "transformer", "linear-attention"]
+  notes: "LyCodec v2.1 production training with Linear Attention and DDSP vocoder"
+  resume: false                    # Resume previous run if crashed
+  
+  # WandB specific settings
+  log_model: true                  # Save model artifacts
+  log_code: true                   # Save code state
+  log_config: true                 # Save configuration
+  
+# TensorBoard logging (parallel to WandB)
+tensorboard:
+  enabled: true                    # Keep TensorBoard for local monitoring
+  log_dir: "logs/tensorboard"      # TensorBoard log directory
