@@ -1,387 +1,114 @@
-# LyCodec v2.5 Continuous Architecture Configuration
-# ==================================================
-# f10c10 compression with semantic-preserving continuous latent space
-# Optimized for V100×4 16GB training with 44.1kHz stereo audio
+# LyCodec Training Configuration
+# Optimized for V100×4 16GB setup
 
 # Random seed for reproducibility
 seed: 42
 
-# Model architecture configuration
-model:
-  # Core dimensions for continuous architecture
-  hidden_dim: 512
-  num_layers: 8
-  num_attention_heads: 8
-  feedforward_dim: 2048
-
-  # Continuous latent specifications (f10c10)
-  compression_ratio: 100      # f10c10 = 100:1 compression
-  latent_channels: 64         # Continuous latent channels
-  latent_length: 2205         # 220500 / 100 = 2205
-  
-  # Semantic preservation parameters
-  semantic_dim: 256
-  num_semantic_tasks: 4
-  contrastive_temperature: 0.07
-  
-  # Variational bottleneck settings
-  kl_weight: 0.0001          # 1e-4
-  beta_vae: true             # Enable β-VAE for disentanglement
-  
-  # Information bottleneck settings
-  mi_weight: 0.1             # Mutual information weight
-  compression_target: 0.1    # Target compression level
-  
-  # Psychoacoustic transform settings
-  psycho_bands: 64
-  psycho_window_size: 2048
-  psycho_hop_length: 512
-  
-  # DDSP vocoder configuration
-  harmonics_count: 48        # Harmonic oscillators
-  noise_bands: 8             # Noise filter bands
-  vocoder_hidden_dim: 256
-  
-  # Bit allocation parameters (ultra-low bitrate)
-  min_bitrate: 64            # kbps (ultra-low)
-  max_bitrate: 256           # kbps
-  target_bitrate: 128        # kbps default
-  complexity_lookahead: 16
-  safety_factor: 1.2
-
-# Audio data configuration
+# Data configuration
 data:
-  # Data paths
-  train_dir: "dataset/raw/music"
-  val_dir: "dataset/raw/music"
-  
-  # Audio processing parameters
-  sample_rate: 44100
-  channels: 2
-  segment_length: 5.0        # seconds
-  segments_per_track: 3      # segments per audio file
-  
-  # Data loading optimization
-  batch_size: 6              # Reduced for v2.5 memory usage
-  num_workers: 4
-  cache_size: 800            # Reduced cache size
-  
-  # Augmentation settings
-  augment: true
-  augmentation_prob: 0.3
+  data_dir: "dataset/raw/music"           # Path to raw audio files
+  segment_seconds: 5.0                    # Length of each training segment
+  samples_per_track: 3                    # Number of samples per audio file
+  file_limit: 10                          # Maximum number of audio files (<10)
+
+# Model architecture configuration  
+model:
+  latent_dim: 64                          # Latent representation channels
+  base_channels: 64                       # Base number of channels
+  n_layers: 6                             # Number of encoder/decoder layers
 
 # Training configuration
 training:
-  # Training duration
-  num_epochs: 120            # Increased for continuous learning
+  # Batch and memory settings (optimized for 16GB VRAM)
+  batch_size: 4                           # Per-GPU batch size
+  accumulate_grad_batches: 4              # Gradient accumulation (effective batch: 16)
+  num_workers: 4                          # Data loading workers per GPU
   
-  # Optimization settings
-  optimizer:
-    type: "adamw"
-    learning_rate: 2e-4      # Slightly reduced for stability
-    betas: [0.9, 0.999]
-    weight_decay: 0.01
-    eps: 1e-8
+  # Optimization
+  learning_rate: 1e-4                     # Peak learning rate
+  num_epochs: 1000                        # Total training epochs
   
-  # Learning rate scheduling
-  scheduler:
-    type: "cosine_annealing"
-    T_max: 60000             # Increased for longer training
-    eta_min: 1e-6
+  # Memory optimization
+  mixed_precision: true                   # Use AMP for memory efficiency
+  gradient_checkpointing: true            # Enable gradient checkpointing
   
-  # Memory optimization for V100×4 16GB
-  gradient_checkpointing: true
-  mixed_precision: true
+  # Checkpointing
+  checkpoint_dir: "checkpoints"           # Directory to save checkpoints
+  save_every: 50                          # Save checkpoint every N epochs
   
-  # Gradient clipping (adaptive P95 percentile)
-  gradient_clip_window: 100
-  gradient_clip_percentile: 95.0
-  
-  # Checkpointing and logging
-  checkpoint_dir: "checkpoints_v25"
-  log_dir: "logs_v25"
-  checkpoint_interval: 1000
-  log_interval: 50
-  max_checkpoints: 5
+  # Distributed training
+  find_unused_parameters: false           # DDP optimization
 
-# Loss function weights for v2.5
+# Audio processing configuration
+audio:
+  sample_rate: 44100                      # Audio sample rate
+  n_fft: 2048                             # FFT size
+  hop_length: 512                         # STFT hop length (f10 compression in time)
+  n_mels: 128                             # Number of mel bands
+  
+  # Psychoacoustic settings
+  n_gammatone_filters: 64                 # Gammatone filterbank size
+  psychoacoustic_weight: 0.1              # Weight for psychoacoustic loss
+  
+  # Audio normalization method
+  normalize_method: "rms"                 # "rms", "peak", or "lufs"
+
+# Compression settings (f10c10 = 100x compression)
+compression:
+  frequency_compression: 10               # Frequency axis compression factor
+  time_compression: 10                    # Time axis compression factor
+  total_compression: 100                  # Total compression ratio
+
+# Loss function weights
 loss:
-  # Primary losses
-  reconstruction_weight: 1.0      # Time-domain reconstruction
-  perceptual_weight: 0.1          # Multi-scale STFT loss
+  magnitude_weight: 1.0                   # Magnitude spectrum loss
+  phase_weight: 0.1                       # Phase loss
+  spectral_weight: 0.5                    # Multi-scale spectral loss  
+  time_weight: 0.3                        # Time-domain loss
+  latent_weight: 0.01                     # Latent regularization
   
-  # Continuous space losses
-  kl_weight: 0.1                  # KL divergence regularization
-  semantic_weight: 0.3            # Semantic preservation
-  contrastive_weight: 0.2         # Contrastive semantic learning
-  consistency_weight: 0.15        # Semantic consistency
-  
-  # Information theory losses
-  information_bottleneck_weight: 0.05  # Information bottleneck
-  mutual_information_weight: 0.02      # Mutual information regularization
-  
-  # Traditional losses (reduced weight)
-  bitrate_weight: 0.005           # Bitrate efficiency (reduced)
-
-# v2.5 specific training settings
-continuous_training:
-  # Semantic preservation training
-  semantic_task_weights:
-    speech_recognition: 0.25
-    music_classification: 0.25
-    emotion_recognition: 0.25
-    speaker_identification: 0.25
-  
-  # Contrastive learning
-  contrastive_batch_size: 64      # Batch size for contrastive pairs
-  temperature_schedule: "constant" # Temperature scheduling
-  
-  # Variational training
-  beta_schedule: "constant"       # β-VAE schedule
-  kl_annealing_steps: 10000       # KL annealing steps
-  
-  # Information bottleneck training
-  mi_estimation_samples: 1000     # Samples for MI estimation
-  compression_schedule: "linear"   # Compression target schedule
-
-# Production deployment settings
-deployment:
-  # Inference optimization
-  inference_batch_size: 1
-  max_sequence_length: 220500     # 5 seconds at 44.1kHz
-  
-  # Continuous space inference
-  latent_cache_size: 100          # Cache for latent representations
-  semantic_consistency_check: true # Verify semantic consistency
-  
-  # Real-time factors (RTF) - improved with continuous space
-  target_rtf_server: 0.35         # Better than v2.1 due to efficiency
-  target_rtf_mobile: 0.8          # Improved mobile performance
-  
-  # Memory constraints (reduced due to continuous efficiency)
-  inference_memory_limit_gb: 6    # Reduced from 8GB
-  
-  # Quality settings (ultra-low bitrate focused)
-  default_bitrate: 128            # kbps
-  quality_presets:
-    ultra_low: 64                 # kbps (new ultra-low setting)
-    low: 96                       # kbps
-    medium: 128                   # kbps  
-    high: 192                     # kbps
-    premium: 256                  # kbps
-
-# Monitoring and validation
-monitoring:
-  # Metrics to track (v2.5 specific)
-  track_metrics:
-    - "total_loss"
-    - "reconstruction_loss"
-    - "perceptual_loss"
-    - "kl_loss"
-    - "semantic_loss"
-    - "contrastive_loss"
-    - "consistency_loss"
-    - "information_bottleneck_loss"
-    - "compression_ratio"
-    - "semantic_similarity"
-    - "latent_smoothness"
-    - "memory_utilization"
-    - "grad_norm"
-  
-  # Validation settings
-  validation_interval: 1000
-  validation_samples: 100
-  
-  # Continuous space validation
-  semantic_validation: true       # Validate semantic preservation
-  interpolation_validation: true  # Validate smooth interpolation
-  
-  # Early stopping
-  early_stopping:
-    enabled: true
-    patience: 15                  # Increased patience for continuous learning
-    min_delta: 1e-5              # Smaller delta for fine-grained improvement
-  
-  # Performance benchmarking
-  benchmark_interval: 5000
-  rtf_measurement_samples: 50
-
-# Hardware-specific optimizations
-hardware:
-  # V100 specific settings
-  gpu_memory_limit: 16
-  target_gpu_utilization: 0.8    # Slightly reduced for stability
-  
-  # Multi-GPU training
-  distributed_backend: "nccl"
-  sync_bn: true
-  
-  # CUDA optimization
-  cuda_benchmark: true
-  deterministic: false
-  
-  # Memory management (optimized for continuous space)
-  empty_cache_interval: 800      # More frequent for continuous training
-  max_split_size_mb: 256         # Reduced for better memory management
-
-# Experimental features for v2.5
-experimental:
-  # Advanced continuous space features
-  semantic_interpolation: true    # Enable semantic interpolation
-  adaptive_compression: true     # Content-adaptive compression
-  hierarchical_semantics: true   # Multi-level semantic features
-  
-  # Information theory extensions
-  mine_estimation: true          # MINE for MI estimation
-  beta_vae_scheduling: false     # Dynamic β scheduling
-  
-  # Advanced training techniques
-  gradient_accumulation_steps: 2  # Increased for stability
-  warmup_steps: 2000             # Increased warmup
-  cosine_restarts: true          # Enable cosine restarts
-  
-  # Model compression (for deployment)
-  knowledge_distillation: false
-  pruning_enabled: false
-  quantization_aware_training: false  # For future ultra-efficiency
-
-# Debugging and development
-debug:
-  # Debug modes
-  debug_mode: false
-  profile_training: false
-  
-  # Logging levels
-  log_level: "INFO"
-  verbose_logging: false
-  
-  # v2.5 specific debugging
-  semantic_debugging: false      # Debug semantic preservation
-  latent_visualization: false    # Visualize latent space
-  interpolation_debugging: false # Debug interpolation quality
-  
-  # Memory debugging
-  detect_anomaly: false
-  memory_profiling: false
-  
-  # Model analysis
-  analyze_gradients: false
-  save_activations: false
-  analyze_semantic_flow: false   # Analyze semantic information flow
-
-# Audio quality validation
+# Validation settings
 validation:
-  # Objective metrics
-  compute_pesq: false
-  compute_stoi: false
-  compute_mel_distance: true
-  
-  # Semantic quality metrics (v2.5 specific)
-  compute_semantic_similarity: true    # Semantic preservation score
-  compute_interpolation_quality: true # Interpolation smoothness
-  compute_latent_consistency: true    # Latent space consistency
-  
-  # Subjective quality targets (updated for v2.5)
-  target_mos: 4.2                     # Slightly reduced due to higher compression
-  target_semantic_similarity: 0.9     # High semantic preservation
-  target_interpolation_smoothness: 0.85 # Smooth interpolation
-  
-  # Validation audio samples
-  reference_tracks:
-    - "reference_orchestral.wav"
-    - "reference_electronic.wav"
-    - "reference_vocal.wav"
-    - "reference_speech.wav"
-    - "reference_jazz.wav"           # Additional for semantic diversity
-  
-  # Test conditions (updated bitrate range)
-  test_bitrates: [64, 96, 128, 192, 256]
-  test_segment_lengths: [5.0, 10.0, 30.0]
+  val_split: 0.1                          # Validation split ratio
+  val_every: 10                           # Validate every N epochs
 
-# Production readiness checklist for v2.5
-production_ready:
-  # Model requirements
-  max_model_size_mb: 250              # Increased for v2.5 complexity
-  max_inference_memory_gb: 6          # Reduced due to efficiency
-  min_quality_mos: 3.8                # Adjusted for ultra-compression
-  min_semantic_similarity: 0.85       # Semantic preservation requirement
-  
-  # Performance requirements (improved)
-  max_inference_rtf: 0.8              # Better performance
-  max_encoding_latency_ms: 80         # Improved latency
-  max_decoding_latency_ms: 40         # Improved decoding
-  
-  # Stability requirements
-  max_gradient_explosion_rate: 0.005  # Tighter control
-  max_checkpoint_corruption_rate: 0.0005
-  min_convergence_stability: 0.97     # Higher stability
-  
-  # v2.5 specific requirements
-  min_compression_efficiency: 95      # 95:1 minimum (out of 100:1 target)
-  max_semantic_drift: 0.1             # Maximum allowed semantic drift
-  min_interpolation_quality: 0.8      # Minimum interpolation quality
-  
-  # Compatibility requirements
-  min_pytorch_version: "2.0.0"        # Updated for v2.5
-  supported_cuda_versions: ["11.8", "12.0", "12.1", "12.2"]
-  fallback_cpu_support: true
+# Inference optimization (for <10GB VRAM)
+inference:
+  half_precision: true                    # Use FP16 for inference
+  max_chunk_length: 220500                # Maximum chunk length (5 seconds)
+  overlap_length: 4410                    # Chunk overlap (0.1 seconds)
+  cpu_fallback: true                      # Fallback to CPU if low VRAM
 
-# Paths and directories
-paths:
-  # Data directories
-  dataset_root: "dataset"
-  raw_audio_dir: "dataset/raw/music"
-  processed_audio_dir: "dataset/processed"
+# Logging and monitoring
+logging:
+  log_level: "INFO"                       # Logging level
+  log_every: 100                          # Log every N batches
+  tensorboard_dir: "logs"                 # TensorBoard logs directory
   
-  # Output directories (v2.5 specific)
-  model_output_dir: "models_v25"
-  checkpoint_dir: "checkpoints_v25"
-  log_dir: "logs_v25"
-  tensorboard_dir: "logs_v25/tensorboard"
+# Hardware optimization (V100×4 16GB optimized)
+hardware:
+  # V100 specific optimizations
+  use_tensor_cores: true                  # Enable Tensor Core usage for mixed precision
+  cudnn_benchmark: false                  # Disable for reproducibility, enable for speed after debugging
   
-  # Temporary directories
-  temp_dir: "/tmp/lycodec_v25"
-  cache_dir: "cache_v25"
+  # Memory management for 16GB cards
+  empty_cache_every: 20                   # Clear CUDA cache every N batches (reduced for V100)
+  max_memory_fraction: 0.90               # Conservative for multi-process training
   
-  # Export directories
-  export_dir: "exports_v25"
-  onnx_dir: "exports_v25/onnx"
-  torchscript_dir: "exports_v25/torchscript"
+  # V100 optimization flags
+  torch_compile: false                    # PyTorch 2.0 compile (experimental)
+  channels_last: false                    # Memory format optimization
   
-  # v2.5 specific directories
-  semantic_cache_dir: "cache_v25/semantic"
-  latent_analysis_dir: "analysis_v25/latents"
-
-# WandB configuration for v2.5
-wandb:
-  enabled: true
-  project: "lycodec-v2.5-continuous"
-  run_name: null
-  group: "continuous-architecture"
-  job_type: "train"
-  tags: 
-    - "audio-codec"
-    - "continuous-latent"
-    - "semantic-preservation"
-    - "f10c10-compression"
-    - "ddsp"
-    - "transformer"
-  notes: "LyCodec v2.5 continuous architecture with f10c10 compression and semantic preservation"
-  resume: false
+# Advanced features
+advanced:
+  # Triton kernel optimizations (experimental)
+  use_triton_kernels: false               # Enable custom Triton kernels
   
-  # v2.5 specific logging
-  log_model: true
-  log_code: true
-  log_config: true
-  log_semantic_metrics: true          # Log semantic preservation metrics
-  log_interpolation_samples: true     # Log interpolation examples
+  # Progressive training
+  progressive_training: false             # Start with shorter sequences
   
-# TensorBoard logging
-tensorboard:
-  enabled: true
-  log_dir: "logs_v25/tensorboard"
+  # Perceptual optimization
+  perceptual_loss: true                   # Enable perceptual loss
   
-  # v2.5 specific TensorBoard features
-  log_latent_histograms: true         # Log latent distributions
-  log_semantic_embeddings: true      # Log semantic embeddings
-  log_interpolation_audio: true      # Log interpolation audio samples
+  # Dynamic loss scaling
+  dynamic_loss_scaling: true              # Adaptive loss scaling for stability

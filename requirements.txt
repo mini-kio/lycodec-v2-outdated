@@ -1,9 +1,50 @@
-torch
-torchaudio
-librosa
-numpy
-tensorboard
-wandb
-pyyaml
-tqdm
-flash-attn
+# LyCodec Dependencies
+
+# Core ML frameworks
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Audio processing
+soundfile>=0.12.1
+librosa>=0.10.0
+numpy>=1.21.0
+soxr>=0.3.5  # High-quality audio resampling (5x faster than scipy)
+
+# Configuration and utilities
+PyYAML>=6.0
+tqdm>=4.64.0
+pathlib2>=2.3.7
+
+# Scientific computing
+scipy>=1.9.0
+
+# Optional: For advanced optimizations
+# triton>=2.0.0  # Uncomment for Triton kernel optimizations
+
+# Development and debugging
+tensorboard>=2.11.0
+matplotlib>=3.5.0
+seaborn>=0.11.0
+wandb>=0.15.0  # Experiment tracking for V100 multi-GPU training
+
+# Data handling
+h5py>=3.7.0
+
+# Distributed training
+ninja>=1.10.0  # For faster compilation
+
+# Audio format support
+ffmpeg-python>=0.2.0  # For additional audio format support
+
+# Utilities
+click>=8.0.0
+rich>=12.0.0  # For beautiful terminal output
+
+# Optional GPU acceleration
+# nvidia-ml-py3>=7.352.0  # For GPU monitoring
+
+# Development tools (optional)
+# black>=22.0.0
+# flake8>=4.0.0
+# pytest>=7.0.0
