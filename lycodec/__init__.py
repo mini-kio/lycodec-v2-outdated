@@ -2,13 +2,15 @@
 LyCodec - High-Quality Stereo Audio Codec with Psychoacoustic Features
 f10c10 compression (100x) with phase preservation and perceptual optimization
 
-v0.1.3 Major Features:
+v2.0 Major Features:
 - Real-time streaming decoder with ~100ms latency
 - V100×4 16GB optimized training with WandB logging
 - Enhanced multi-GPU stability and memory management
 - Improved scheduler with warm restart support
 - JIT-safe gradient checkpointing
 - Cached import optimization for better startup time
+- Progress tracking with tqdm for training visibility
+- Configurable dataset limits and improved distributed logging
 """
 
 from .inference import LyCodec
@@ -26,7 +28,7 @@ from .audio import (
 from .training import LyCodecTrainer
 from .streaming import StreamingDecoder, create_streaming_decoder
 
-__version__ = "0.1.3"
+__version__ = "2.0"
 __author__ = "Mini_kio"
 
 __all__ = [

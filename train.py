@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-LyCodec Training Script - IMPROVED VERSION
-Optimized for V100×4 16GB setup with mixed precision and distributed training
+LyCodec Training Script v2.0 - ACCELERATE VERSION
+Optimized for V100×4 16GB setup with Accelerate for easy distributed training
 """
 
 import os
@@ -13,39 +13,75 @@ from pathlib import Path
 from typing import Dict, Any
 
 import torch
-import torch.multiprocessing as mp
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 import soundfile as sf
 import numpy as np
 
-# IMPROVED: Add wandb for experiment tracking
+# IMPROVED: Use Accelerate instead of manual DDP
 try:
-    import wandb
-    HAS_WANDB = True
+    from accelerate import Accelerator
+    HAS_ACCELERATE = True
 except ImportError:
-    print("Warning: wandb not available, logging to console only")
-    HAS_WANDB = False
+    print("Warning: Accelerate not available. Please install with: pip install accelerate")
+    print("Falling back to single GPU training.")
+    HAS_ACCELERATE = False
+    
+    # Dummy Accelerator class for fallback
+    class DummyAccelerator:
+        def __init__(self, **kwargs):
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.is_main_process = True
+            self.num_processes = 1
+            self.process_index = 0
+            self.mixed_precision = 'no'
+        
+        def prepare(self, *args):
+            return args if len(args) > 1 else args[0]
+        
+        def backward(self, loss):
+            loss.backward()
+        
+        def accumulate(self, model):
+            from contextlib import nullcontext
+            return nullcontext()  # Proper context manager
+        
+        def clip_grad_norm_(self, parameters, max_norm):
+            torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+        
+        def get_state_dict(self, model):
+            return model.state_dict()
+        
+        def load_state_dict(self, model, state_dict):
+            model.load_state_dict(state_dict)
+        
+        @property
+        def sync_gradients(self):
+            return True
+    
+    Accelerator = DummyAccelerator
 
 from lycodec.training import LyCodecTrainer
 from lycodec.audio import normalize_audio, high_quality_resample, create_deterministic_seed, get_optimal_pin_memory
 
 class AudioDataset(torch.utils.data.Dataset):
     """
-    Dataset for audio files with 5-second sampling (3 samples per track) - IMPROVED VERSION
+    Dataset for audio files with 5-second sampling (3 samples per track) - IMPROVED VERSION v2.0
     """
     def __init__(self, 
                  data_dir: str,
                  segment_length: int = 220500,  # 5 seconds at 44.1kHz
                  samples_per_track: int = 3,
-                 file_limit: int = 10,
+                 file_limit: int = None,  # IMPROVED: None means use all files
                  normalize_method: str = 'rms',
-                 sample_rate: int = 44100):  # IMPROVED: Allow config override
+                 sample_rate: int = 44100,
+                 rank: int = 0):  # IMPROVED: Add rank for distributed logging
         
         self.data_dir = Path(data_dir)
         self.segment_length = segment_length
         self.samples_per_track = samples_per_track
         self.normalize_method = normalize_method
-        self.sample_rate = sample_rate  # IMPROVED: Use config value
+        self.sample_rate = sample_rate
+        self.rank = rank  # IMPROVED: Store rank for logging control
         
         # Find all audio files
         audio_extensions = ['.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aiff', '.au']
@@ -59,12 +95,20 @@ class AudioDataset(torch.utils.data.Dataset):
         # Remove duplicates and sort for consistency
         self.audio_files = sorted(list(set(self.audio_files)))
         
-        # Limit number of files
-        if len(self.audio_files) > file_limit:
-            print(f"Found {len(self.audio_files)} audio files, limiting to {file_limit}")
-            self.audio_files = self.audio_files[:file_limit]
+        # IMPROVED: Only log from main process to avoid duplicate messages
+        if self.rank == 0:
+            print(f"Found {len(self.audio_files)} audio files")
         
-        print(f"Dataset: {len(self.audio_files)} audio files")
+        # IMPROVED: Use all files if file_limit is None
+        if file_limit is not None and len(self.audio_files) > file_limit:
+            if self.rank == 0:  # IMPROVED: Only log from main process
+                print(f"Limiting to {file_limit} audio files (configurable in config.yaml)")
+            self.audio_files = self.audio_files[:file_limit]
+        elif self.rank == 0:
+            print(f"Using all {len(self.audio_files)} audio files")
+        
+        if self.rank == 0:  # IMPROVED: Only log from main process
+            print(f"Dataset: {len(self.audio_files)} audio files")
         
         # Create sample list (3 samples per track)
         self.samples = []
@@ -72,7 +116,8 @@ class AudioDataset(torch.utils.data.Dataset):
             for i in range(samples_per_track):
                 self.samples.append((file_path, i))
         
-        print(f"Total samples: {len(self.samples)}")
+        if self.rank == 0:  # IMPROVED: Only log from main process
+            print(f"Total samples: {len(self.samples)}")
     
     def __len__(self):
         return len(self.samples)
@@ -86,7 +131,9 @@ class AudioDataset(torch.utils.data.Dataset):
             
             # IMPROVED: Use high-quality resampling instead of np.interp
             if sr != self.sample_rate:
-                print(f"Resampling {file_path.name} from {sr}Hz to {self.sample_rate}Hz")
+                # IMPROVED: Only log resampling from main process to reduce noise
+                if self.rank == 0 and sample_idx == 0:  # Log once per file
+                    print(f"Resampling {file_path.name} from {sr}Hz to {self.sample_rate}Hz")
                 audio = high_quality_resample(audio.T, sr, self.sample_rate).T
             
             # Convert to stereo if mono
@@ -125,7 +172,9 @@ class AudioDataset(torch.utils.data.Dataset):
             }
             
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
+            # IMPROVED: Only log errors from main process
+            if self.rank == 0:
+                print(f"Error loading {file_path}: {e}")
             # Return silence as fallback
             audio = np.zeros((2, self.segment_length), dtype=np.float32)
             return {
@@ -135,28 +184,23 @@ class AudioDataset(torch.utils.data.Dataset):
                 'original_sr': self.sample_rate
             }
 
-def setup_data_loader(config: Dict[str, Any], rank: int = 0, world_size: int = 1):
-    """Setup data loader with distributed sampling - IMPROVED"""
+def setup_data_loader(config: Dict[str, Any], accelerator: Accelerator):
+    """Setup data loader with Accelerate - IMPROVED"""
     # IMPROVED: Use config values instead of hardcoded constants
     sample_rate = config.get('audio', {}).get('sample_rate', 44100)
+    
+    # IMPROVED: Handle None file_limit to use all files
+    file_limit = config['data'].get('file_limit', None)
     
     dataset = AudioDataset(
         data_dir=config['data']['data_dir'],
         segment_length=int(sample_rate * config['data']['segment_seconds']),
         samples_per_track=config['data']['samples_per_track'],
-        file_limit=config['data']['file_limit'],
+        file_limit=file_limit,  # IMPROVED: Can be None to use all files
         normalize_method=config.get('audio', {}).get('normalize_method', 'rms'),
-        sample_rate=sample_rate  # IMPROVED: Pass sample_rate from config
+        sample_rate=sample_rate,  # IMPROVED: Pass sample_rate from config
+        rank=accelerator.process_index  # IMPROVED: Use accelerator rank
     )
-    
-    # Distributed sampler
-    sampler = DistributedSampler(
-        dataset, 
-        num_replicas=world_size, 
-        rank=rank,
-        shuffle=True,
-        drop_last=True  # Ensure consistent batch sizes across ranks
-    ) if world_size > 1 else None
     
     # IMPROVED: Conditional pin_memory
     pin_memory = get_optimal_pin_memory()
@@ -164,87 +208,151 @@ def setup_data_loader(config: Dict[str, Any], rank: int = 0, world_size: int = 1
     dataloader = DataLoader(
         dataset,
         batch_size=config['training']['batch_size'],
-        sampler=sampler,
-        shuffle=(sampler is None),
+        shuffle=True,  # Accelerate handles distributed sampling automatically
         num_workers=config['training']['num_workers'],
         pin_memory=pin_memory,
         drop_last=True,
         persistent_workers=True if config['training']['num_workers'] > 0 else False
     )
     
-    return dataloader, sampler
+    return dataloader
 
-def create_validation_loader(config: Dict[str, Any], rank: int = 0, world_size: int = 1):
+def create_validation_loader(config: Dict[str, Any], accelerator: Accelerator):
     """Create validation data loader"""
     val_config = config.copy()
     val_config['data']['samples_per_track'] = 1  # Only 1 sample per track for validation
     val_config['training']['batch_size'] = max(1, config['training']['batch_size'] // 2)  # Smaller batch for validation
     
-    return setup_data_loader(val_config, rank, world_size)
+    return setup_data_loader(val_config, accelerator)
 
-def train_worker(rank: int, world_size: int, config: Dict[str, Any]):
-    """Training worker for distributed training - IMPROVED"""
+def main():
+    parser = argparse.ArgumentParser(description='Train LyCodec v2.0 - Accelerate Version')
+    parser.add_argument('--config', type=str, default='config.yaml', 
+                       help='Configuration file path')
+    parser.add_argument('--resume', type=str, default=None,
+                       help='Resume from specific checkpoint')
+    parser.add_argument('--validate-only', action='store_true',
+                       help='Run validation only')
+    args = parser.parse_args()
     
-    # IMPROVED: Set environment variables for distributed training with random port
-    import random
-    os.environ['RANK'] = str(rank)
-    os.environ['LOCAL_RANK'] = str(rank)
-    os.environ['WORLD_SIZE'] = str(world_size)
-    os.environ['MASTER_ADDR'] = 'localhost'
+    # Load configuration
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
     
-    # IMPROVED: Random port to avoid conflicts in multi-experiment setups
-    if 'MASTER_PORT' not in os.environ:
-        master_port = 12000 + random.randint(0, 2000)
-        os.environ['MASTER_PORT'] = str(master_port)
+    # IMPROVED: Validate and convert config types to prevent type errors
+    def validate_config(config):
+        """Validate and convert config values to proper types"""
+        # Training config type validation
+        training = config.get('training', {})
+        training['learning_rate'] = float(training.get('learning_rate', 1e-4))
+        training['batch_size'] = int(training.get('batch_size', 4))
+        training['accumulate_grad_batches'] = int(training.get('accumulate_grad_batches', 4))
+        training['num_epochs'] = int(training.get('num_epochs', 1000))
+        training['num_workers'] = int(training.get('num_workers', 4))
+        training['save_every'] = int(training.get('save_every', 50))
+        training['mixed_precision'] = bool(training.get('mixed_precision', True))
+        training['gradient_checkpointing'] = bool(training.get('gradient_checkpointing', True))
+        
+        # Data config type validation
+        data = config.get('data', {})
+        data['segment_seconds'] = float(data.get('segment_seconds', 5.0))
+        data['samples_per_track'] = int(data.get('samples_per_track', 3))
+        if data.get('file_limit') is not None:
+            data['file_limit'] = int(data['file_limit'])
+        
+        # Audio config type validation
+        audio = config.get('audio', {})
+        audio['sample_rate'] = int(audio.get('sample_rate', 44100))
+        
+        # Seed validation
+        config['seed'] = int(config.get('seed', 42))
+        
+        return config
     
-    # IMPROVED: Add NCCL debug for multi-node expansion
-    os.environ.setdefault('NCCL_DEBUG', 'INFO')
+    config = validate_config(config)
     
-    # IMPROVED: Calculate total_steps dynamically
-    dataloader, sampler = setup_data_loader(config, rank, world_size)
+    # IMPROVED: Initialize Accelerator (handles all distributed setup automatically)
+    if HAS_ACCELERATE:
+        accelerator = Accelerator(
+            mixed_precision='fp16' if config['training']['mixed_precision'] else 'no',
+            gradient_accumulation_steps=config['training']['accumulate_grad_batches'],
+            log_with='wandb' if config.get('wandb', {}).get('enabled', True) else None,
+            project_dir=config['training']['checkpoint_dir']
+        )
+    else:
+        # Fallback to dummy accelerator for single GPU
+        accelerator = Accelerator()
+    
+    # IMPROVED: Set random seeds more thoroughly
+    seed = config.get('seed', 42)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    
+    # Enable deterministic algorithms for reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False  # Disable for reproducibility, enable for speed
+    
+    # Override resume checkpoint if specified
+    if args.resume:
+        config['training']['resume_checkpoint'] = args.resume
+    
+    # IMPROVED: Print info only from main process
+    if accelerator.is_main_process:
+        print(f"Training on {accelerator.num_processes} GPUs with Accelerate")
+        print(f"Mixed precision: {accelerator.mixed_precision}")
+        print(f"Device: {accelerator.device}")
+    
+    # Setup data loader
+    dataloader = setup_data_loader(config, accelerator)
+    
+    # Calculate total steps
     steps_per_epoch = len(dataloader) // config['training']['accumulate_grad_batches']
     total_steps = steps_per_epoch * config['training']['num_epochs']
     
     # IMPROVED: Use config values instead of hardcoded constants
     sample_rate = config.get('audio', {}).get('sample_rate', 44100)
     
-    # Setup trainer with calculated total_steps
+    # Setup trainer with Accelerator
     trainer = LyCodecTrainer(
-        model_config=config['model'],
-        learning_rate=config['training']['learning_rate'],
-        batch_size=config['training']['batch_size'],
-        accumulate_grad_batches=config['training']['accumulate_grad_batches'],
+        model_config={
+            **config['model'],
+            'use_triton': config.get('advanced', {}).get('use_triton_kernels', True)  # IMPROVED: Pass Triton option
+        },
+        learning_rate=float(config['training']['learning_rate']),  # FIXED: Ensure float type
+        batch_size=int(config['training']['batch_size']),
+        accumulate_grad_batches=int(config['training']['accumulate_grad_batches']),
         max_sequence_length=int(sample_rate * config['data']['segment_seconds']),
-        use_amp=config['training']['mixed_precision'],
-        use_checkpointing=config['training']['gradient_checkpointing'],
-        world_size=world_size,
-        total_steps=total_steps  # IMPROVED: Pass calculated total_steps
+        use_amp=bool(config['training']['mixed_precision']),
+        use_checkpointing=bool(config['training']['gradient_checkpointing']),
+        total_steps=total_steps,
+        accelerator=accelerator  # IMPROVED: Pass accelerator to trainer
     )
     
-    # IMPROVED: Initialize wandb for experiment tracking (V100 multi-GPU optimized)
-    if trainer.is_main_process and HAS_WANDB:
-        # Initialize wandb with V100 hardware info
-        wandb.init(
-            project="lycodec-v100-training",
-            name=f"lycodec-{config.get('seed', 42)}-{world_size}gpu",
-            config={
+    # IMPROVED: Initialize wandb if using Accelerate's wandb integration
+    if accelerator.is_main_process and config.get('wandb', {}).get('enabled', True):
+        wandb_config = {
+            'project': config.get('wandb', {}).get('project', 'lycodec-v2-training'),
+            'name': f"lycodec-v2-{config.get('seed', 42)}-{accelerator.num_processes}gpu",
+            'config': {
                 **config,
-                'world_size': world_size,
-                'effective_batch_size': config['training']['batch_size'] * config['training']['accumulate_grad_batches'] * world_size,
+                'num_processes': accelerator.num_processes,
+                'effective_batch_size': config['training']['batch_size'] * config['training']['accumulate_grad_batches'] * accelerator.num_processes,
                 'gpu_type': 'V100-16GB',
-                'total_steps': total_steps
+                'total_steps': total_steps,
+                'version': '2.0'
             },
-            tags=['lycodec', 'f10c10', 'v100', f'{world_size}gpu'],
-            notes=f"LyCodec training on {world_size}x V100 16GB"
-        )
-        print(f"WandB initialized: {wandb.run.name}")
+            'tags': config.get('wandb', {}).get('tags', ['lycodec', 'f10c10', 'v100', f'{accelerator.num_processes}gpu', 'v2.0']),
+            'notes': f"LyCodec v2.0 training on {accelerator.num_processes}x V100 16GB with Accelerate"
+        }
+        trainer.setup_wandb(wandb_config)
     
     # Setup validation data if requested
     val_dataloader = None
-    val_sampler = None
     if config.get('validation', {}).get('val_split', 0) > 0:
-        val_dataloader, val_sampler = create_validation_loader(config, rank, world_size)
-        if trainer.is_main_process:
+        val_dataloader = create_validation_loader(config, accelerator)
+        if accelerator.is_main_process:
             print(f"Validation loader created with {len(val_dataloader)} batches")
     
     # Training loop
@@ -259,31 +367,26 @@ def train_worker(rank: int, world_size: int, config: Dict[str, Any]):
     if latest_checkpoint.exists():
         start_epoch, losses = trainer.load_checkpoint(latest_checkpoint)
         best_loss = losses.get('total_loss', best_loss)
-        if trainer.is_main_process:
+        if accelerator.is_main_process:
             print(f"Resumed from epoch {start_epoch}")
     
-    # Training epochs
+    # IMPROVED: Training epochs with Accelerate
     for epoch in range(start_epoch, config['training']['num_epochs']):
-        if sampler:
-            sampler.set_epoch(epoch)
-        
         # Train epoch
         avg_losses = trainer.train_epoch(dataloader, epoch)
         
         # Validation
         val_losses = {}
         if val_dataloader and (epoch + 1) % config.get('validation', {}).get('val_every', 10) == 0:
-            if val_sampler:
-                val_sampler.set_epoch(epoch)
             val_losses = trainer.validate(val_dataloader)
             
-            if trainer.is_main_process:
+            if accelerator.is_main_process:
                 print("Validation results:")
                 for key, value in val_losses.items():
                     print(f"  {key}: {value:.6f}")
         
-        # Save checkpoint
-        if trainer.is_main_process:
+        # Save checkpoint (only on main process)
+        if accelerator.is_main_process:
             # Combine training and validation losses
             all_losses = {**avg_losses, **val_losses}
             
@@ -302,92 +405,18 @@ def train_worker(rank: int, world_size: int, config: Dict[str, Any]):
             if (epoch + 1) % config['training']['save_every'] == 0:
                 periodic_checkpoint = checkpoint_dir / f'epoch_{epoch:04d}.pt'
                 trainer.save_checkpoint(epoch, all_losses, periodic_checkpoint)
-            
-            # Log progress
-            print(f"Epoch {epoch} completed:")
-            for key, value in all_losses.items():
-                print(f"  {key}: {value:.6f}")
-            print("-" * 50)
-            
-            # IMPROVED: WandB logging for V100 multi-GPU training
-            if HAS_WANDB and wandb.run is not None:
-                # Log metrics
-                log_dict = {
-                    'epoch': epoch,
-                    'learning_rate': trainer.scheduler.get_last_lr()[0] if trainer.scheduler else trainer.learning_rate,
-                    **{f'train/{k}': v for k, v in avg_losses.items()},
-                    **{f'val/{k}': v for k, v in val_losses.items()},
-                    'best_loss': best_loss
-                }
-                
-                # Add GPU memory usage for V100 monitoring
-                if torch.cuda.is_available():
-                    for gpu_id in range(torch.cuda.device_count()):
-                        memory_used = torch.cuda.memory_allocated(gpu_id) / 1024**3  # GB
-                        memory_cached = torch.cuda.memory_reserved(gpu_id) / 1024**3  # GB
-                        log_dict[f'gpu_{gpu_id}/memory_used_gb'] = memory_used
-                        log_dict[f'gpu_{gpu_id}/memory_cached_gb'] = memory_cached
-                
-                wandb.log(log_dict)
-            
-            # IMPROVED: Clear cache periodically to prevent memory buildup
-            if torch.cuda.is_available() and (epoch + 1) % 10 == 0:
-                torch.cuda.empty_cache()
-
-def main():
-    parser = argparse.ArgumentParser(description='Train LyCodec - Improved Version')
-    parser.add_argument('--config', type=str, default='config.yaml', 
-                       help='Configuration file path')
-    parser.add_argument('--gpus', type=int, default=None,
-                       help='Number of GPUs to use (default: auto-detect)')
-    parser.add_argument('--resume', type=str, default=None,
-                       help='Resume from specific checkpoint')
-    parser.add_argument('--validate-only', action='store_true',
-                       help='Run validation only')
-    args = parser.parse_args()
+        
+        # IMPROVED: Use trainer's centralized logging
+        trainer.log_epoch(epoch, avg_losses, val_losses, best_loss)
+        
+        # IMPROVED: Clear cache periodically to prevent memory buildup
+        if torch.cuda.is_available() and (epoch + 1) % 5 == 0:
+            torch.cuda.empty_cache()
     
-    # Load configuration
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-    
-    # IMPROVED: Set random seeds more thoroughly
-    seed = config.get('seed', 42)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    
-    # Enable deterministic algorithms for reproducibility
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False  # Disable for reproducibility, enable for speed
-    
-    # Override resume checkpoint if specified
-    if args.resume:
-        config['training']['resume_checkpoint'] = args.resume
-    
-    # Determine number of GPUs
-    if args.gpus is None:
-        world_size = torch.cuda.device_count()
-    else:
-        world_size = min(args.gpus, torch.cuda.device_count())
-    
-    if world_size == 0:
-        print("No CUDA devices available, training on CPU")
-        world_size = 1
-        train_worker(0, 1, config)
-    elif world_size == 1:
-        print("Training on single GPU")
-        train_worker(0, 1, config)
-    else:
-        print(f"Training on {world_size} GPUs")
-        # IMPROVED: Use spawn for better compatibility
-        mp.set_start_method('spawn', force=True)
-        mp.spawn(train_worker, args=(world_size, config), nprocs=world_size, join=True)
-    
-    # IMPROVED: Clean up wandb after training
-    if HAS_WANDB and wandb.run is not None:
-        wandb.finish()
-        print("WandB run finished")
+    # IMPROVED: Cleanup
+    trainer.cleanup_wandb()
+    if accelerator.is_main_process:
+        print("Training completed successfully!")
 
 if __name__ == '__main__':
     main()

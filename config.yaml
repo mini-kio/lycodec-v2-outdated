@@ -1,4 +1,4 @@
-# LyCodec Training Configuration
+# LyCodec v2.0 Training Configuration
 # Optimized for V100×4 16GB setup
 
 # Random seed for reproducibility
@@ -9,7 +9,7 @@ data:
   data_dir: "dataset/raw/music"           # Path to raw audio files
   segment_seconds: 5.0                    # Length of each training segment
   samples_per_track: 3                    # Number of samples per audio file
-  file_limit: 10                          # Maximum number of audio files (<10)
+  file_limit: null                        # Maximum number of audio files (null = use all files)
 
 # Model architecture configuration  
 model:
@@ -25,19 +25,24 @@ training:
   num_workers: 4                          # Data loading workers per GPU
   
   # Optimization
-  learning_rate: 1e-4                     # Peak learning rate
+  learning_rate: 0.0001                    # Peak learning rate (1e-4)
   num_epochs: 1000                        # Total training epochs
   
   # Memory optimization
-  mixed_precision: true                   # Use AMP for memory efficiency
+  mixed_precision: true                   # Use AMP for memory efficiency (handled by Accelerate)
   gradient_checkpointing: true            # Enable gradient checkpointing
   
   # Checkpointing
   checkpoint_dir: "checkpoints"           # Directory to save checkpoints
   save_every: 50                          # Save checkpoint every N epochs
-  
-  # Distributed training
-  find_unused_parameters: false           # DDP optimization
+
+# Accelerate configuration (set via 'accelerate config' command)
+accelerate:
+  # These settings are managed by Accelerate's config system
+  # Run 'accelerate config' to set up distributed training
+  mixed_precision: "fp16"                 # Options: "no", "fp16", "bf16"
+  gradient_accumulation_steps: 4          # Should match training.accumulate_grad_batches
+  num_processes: 4                        # Number of GPUs to use
 
 # Audio processing configuration
 audio:
@@ -82,7 +87,7 @@ inference:
 # Logging and monitoring
 logging:
   log_level: "INFO"                       # Logging level
-  log_every: 100                          # Log every N batches
+  log_every: 200                          # Log every N batches (reduced from 100)
   tensorboard_dir: "logs"                 # TensorBoard logs directory
   
 # Hardware optimization (V100×4 16GB optimized)
@@ -92,7 +97,7 @@ hardware:
   cudnn_benchmark: false                  # Disable for reproducibility, enable for speed after debugging
   
   # Memory management for 16GB cards
-  empty_cache_every: 20                   # Clear CUDA cache every N batches (reduced for V100)
+  empty_cache_every: 10                   # Clear CUDA cache every N batches (more frequent)
   max_memory_fraction: 0.90               # Conservative for multi-process training
   
   # V100 optimization flags
@@ -101,8 +106,8 @@ hardware:
   
 # Advanced features
 advanced:
-  # Triton kernel optimizations (experimental)
-  use_triton_kernels: false               # Enable custom Triton kernels
+  # Triton kernel optimizations (v2.0 optimized)
+  use_triton_kernels: true                # Enable custom Triton kernels for 2-3x speedup
   
   # Progressive training
   progressive_training: false             # Start with shorter sequences
@@ -112,3 +117,10 @@ advanced:
   
   # Dynamic loss scaling
   dynamic_loss_scaling: true              # Adaptive loss scaling for stability
+
+# WandB experiment tracking (v2.0)
+wandb:
+  project: "lycodec-v2-training"          # Updated project name for v2
+  entity: "your-team"                     # Your WandB team/username
+  enabled: true                           # Enable WandB logging
+  tags: ["lycodec", "v2.0", "f10c10"]    # Tags for experiment organization

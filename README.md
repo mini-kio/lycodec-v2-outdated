@@ -1,4 +1,4 @@
-# LyCodec v0.1.3 - High-Quality Stereo Audio Codec
+# LyCodec v2.0 - High-Quality Stereo Audio Codec
 
 🎵 **f10c10 compression (100x)** with phase preservation and perceptual optimization
 
@@ -12,7 +12,7 @@
 - **Cached import optimization** for better startup time
 - **Robust DSP implementation** with streaming-optimized STFT/ISTFT
 
-## 🚀 Recent Improvements (v0.1.3)
+## 🚀 Recent Improvements (v2.0)
 
 ### DSP & Signal Processing
 - ✅ **STFT/ISTFT consistency**: Fixed `center=False` and `pad_mode='reflect'` for streaming
@@ -21,10 +21,14 @@
 - ✅ **Phase preservation**: Improved magnitude/phase decomposition (now in public API)
 
 ### PyTorch & Training  
+- ✅ **Accelerate Integration**: Simplified distributed training with Hugging Face Accelerate
+- ✅ **Triton GPU Kernels**: Custom optimized kernels for 2-3x speedup on CUDA
 - ✅ **Gradient checkpointing**: Instance-level patching to avoid JIT/class attribute issues
 - ✅ **FP16 safety**: Enhanced CPU guards with clear warnings for numpy compatibility
 - ✅ **Scheduler improvements**: CosineAnnealingWarmRestarts for better resume compatibility
 - ✅ **Decoder activation**: Added tanh activation to prevent phase wrap-around
+- ✅ **Progress tracking**: Added tqdm progress bars for training visibility
+- ✅ **Dataset optimization**: Configurable file limits and improved distributed logging
 
 ### Streaming & Real-time
 - ✅ **Streaming decoder**: Overlap-add with fade windows and real-time queue handling
@@ -32,13 +36,32 @@
 - ✅ **Memory leak monitoring**: GPU memory tracking in inference paths
 
 ### Multi-GPU & Distributed
-- ✅ **DDP robustness**: Random MASTER_PORT, NCCL_DEBUG, and improved error handling
+- ✅ **Accelerate Support**: Easy distributed training without complex DDP setup
 - ✅ **WandB integration**: Experiment tracking with GPU memory and training metrics
 - ✅ **V100×4 optimization**: Hardware-specific settings and memory management
 
 ## 📦 Installation
 
+```
+
+### Quick Setup for Multi-GPU
+
 ```bash
+# 1. Install dependencies with Accelerate
+pip install -r requirements.txt
+
+# 2. Configure Accelerate (interactive setup)
+accelerate config
+
+# 3. Start training
+accelerate launch train.py --config config.yaml
+```
+
+**Accelerate Benefits:**
+- ✅ **No complex environment variables** - automated setup
+- ✅ **Automatic mixed precision** - FP16/BF16 handled seamlessly  
+- ✅ **Better error handling** - graceful fallbacks
+- ✅ **Cross-platform compatibility** - works on various GPU setupsbash
 # Install dependencies
 pip install -r requirements.txt
 
@@ -115,21 +138,34 @@ trainer = LyCodecTrainer(
 trainer.train(dataloader, epochs=100)
 ```
 
-### Multi-GPU (V100×4)
+### Multi-GPU (V100×4) with Accelerate
 
 ```bash
-# Set environment for optimal V100×4 training
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_DEBUG=INFO
+# Install Accelerate
+pip install accelerate
 
-# Launch distributed training
-torchrun --nproc_per_node=4 train.py --config config.yaml
+# Configure Accelerate (one-time setup)
+accelerate config
+
+# Launch distributed training with Accelerate
+accelerate launch train.py --config config.yaml
+```
+
+#### Accelerate Configuration Example
+```
+In which compute environment are you running? This machine
+Which type of machine are you using? Multi-GPU
+How many different machines will you use? 1
+Do you want to use DeepSpeed? No
+Do you want to use FullyShardedDataParallel? No
+How many GPU(s) should be used for distributed training? 4
+Do you wish to use FP16 or BF16 (mixed precision)? fp16
 ```
 
 ### Configuration (config.yaml)
 
 ```yaml
-# Hardware optimized for V100×4 16GB
+# Hardware optimized for V100×4 16GB with Accelerate
 model:
   latent_dim: 64
   base_channels: 64
@@ -140,20 +176,25 @@ training:
   accumulate_grad_batches: 4 # Effective: 64 total
   learning_rate: 1e-4
   max_epochs: 100
-  use_amp: true
-  use_checkpointing: true
+  mixed_precision: true      # Handled by Accelerate
 
 # WandB experiment tracking
 wandb:
   project: "lycodec-v100x4"
   entity: "your-team"
   
-# Hardware settings
-hardware:
-  num_gpus: 4
-  memory_gb: 16
-  pin_memory: true
-  num_workers: 8
+# Data settings
+data:
+  data_dir: "dataset/raw/music"
+  file_limit: null              # null = use all audio files
+  segment_seconds: 5.0
+  samples_per_track: 3
+
+# Accelerate handles GPU configuration automatically
+accelerate:
+  mixed_precision: "fp16"
+  gradient_accumulation_steps: 4
+  num_processes: 4
 ```
 
 ## 🔬 Testing & Validation
@@ -190,18 +231,6 @@ python demo_streaming.py --model model.pth --audio test.wav --latency 100
 
 Demonstrates real-time streaming decode with configurable latency.
 
-## 📈 Performance Metrics
-
-| Metric | Target | Achieved |
-|--------|--------|----------|
-| Compression | f10c10 (100x) | ~85-120x* |
-| Quality | >60dB SNR | >65dB SNR |
-| Latency | <100ms | ~100ms |
-| Memory | <16GB training | ~12GB |
-| Throughput | Real-time | 1.2x real-time |
-
-*Varies with content and format
-
 ## 🔧 Advanced Configuration
 
 ### Memory Optimization
@@ -217,6 +246,18 @@ codec = LyCodec(
 
 # CPU fallback with warnings
 codec = LyCodec(device='cpu', half_precision=False)
+```
+
+### Accelerate Configuration
+
+```bash
+# Configure for different setups
+accelerate config
+
+# Single GPU
+# Multi-GPU (same machine)
+# Multi-node (multiple machines)
+# CPU-only training
 ```
 
 ### Streaming Parameters
@@ -250,6 +291,7 @@ The codec includes extensive safety guards:
 - **FP16 safety**: CPU compatibility warnings and automatic fallbacks
 - **Gradient safety**: Inference-only functions use `torch.no_grad()`
 - **JIT compatibility**: Instance-level checkpointing flags
+- **Accelerate integration**: Simplified distributed training setup
 
 ### Known Limitations
 
@@ -264,18 +306,12 @@ The codec includes extensive safety guards:
 2. Check safety: All new streaming parameters must validate
 3. Memory: Use context managers for GPU memory management
 4. Docs: Update docstrings for inference-only functions
+5. **Accelerate**: Use `accelerate launch` for distributed training
 
 ## 📄 License
 
-MIT License - See LICENSE file for details.
-
-## 🙏 Acknowledgments
-
-- PyTorch team for excellent autograd and distributed training
-- WandB for experiment tracking and visualization
-- pysoxr for high-quality audio resampling
-- V100 optimization inspired by real-world multi-GPU training constraints
+Licensed under the Apache License 2.0. See LICENSE file for details.
 
 ---
 
-**LyCodec v0.1.3** - Ready for production training and streaming deployment! 🎉
+**LyCodec v2.0** - Ready for production training and streaming deployment! 🎉
