@@ -1,0 +1,9 @@
+2025-07-06 17:19:37,899 - lycodec.training - INFO - Applied activation checkpointing to ResidualBlocks
+2025-07-06 17:26:47,219 - lycodec.training - INFO - Applied activation checkpointing to ResidualBlocks
+2025-07-06 17:26:49,792 - lycodec.training - INFO - WandB initialized: lycodec-v2-42-1gpu
+2025-07-06 17:37:26,888 - lycodec.training - INFO - Applied activation checkpointing to ResidualBlocks
+2025-07-06 17:37:29,311 - lycodec.training - INFO - WandB initialized: lycodec-v2-42-1gpu
+2025-07-06 18:00:51,427 - lycodec.training - INFO - Applied activation checkpointing to 12 ResidualBlocks
+2025-07-06 18:00:53,843 - lycodec.training - INFO - WandB initialized: lycodec-v2-42-1gpu
+2025-07-06 18:08:11,240 - lycodec.training - INFO - Applied activation checkpointing to 12 ResidualBlocks
+2025-07-06 18:08:13,740 - lycodec.training - INFO - WandB initialized: lycodec-v2-42-1gpu

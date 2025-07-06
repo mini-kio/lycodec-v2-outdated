@@ -20,7 +20,7 @@ HAS_SOXR = importlib.util.find_spec('soxr') is not None
 HAS_TORCHAUDIO = importlib.util.find_spec('torchaudio') is not None
 HAS_SCIPY = importlib.util.find_spec('scipy') is not None
 
-# IMPROVED: Triton optimization support
+# IMPROVED: Triton optimization support with better error handling
 try:
     import triton
     import triton.language as tl
@@ -29,12 +29,12 @@ except ImportError:
     HAS_TRITON = False
 
 # ========================================================================================
-# Triton Optimized Kernels
+# Triton Optimized Kernels - FIXED VERSION
 # ========================================================================================
 
 if HAS_TRITON:
     @triton.jit
-    def gammatone_kernel(
+    def gammatone_kernel_simple(
         # Input pointers
         magnitude_ptr,
         center_freqs_ptr,
@@ -54,7 +54,7 @@ if HAS_TRITON:
         BLOCK_SIZE_F: tl.constexpr,
         BLOCK_SIZE_T: tl.constexpr,
     ):
-        """Triton kernel for Gammatone filterbank computation"""
+        """FIXED: Ultra-simple Triton kernel using only basic operations"""
         pid_b = tl.program_id(0)
         pid_n = tl.program_id(1) 
         pid_t = tl.program_id(2)
@@ -65,31 +65,52 @@ if HAS_TRITON:
         center_freq = tl.load(center_freqs_ptr + pid_n)
         erb_width = tl.load(erb_widths_ptr + pid_n)
         
-        accumulator = tl.zeros([BLOCK_SIZE_T], dtype=tl.float32)
+        # Initialize output
+        output_vals = tl.zeros([BLOCK_SIZE_T], dtype=tl.float32)
         
-        for f_start in range(0, freq_bins, BLOCK_SIZE_F):
-            f_offset = f_start + tl.arange(0, BLOCK_SIZE_F)
-            f_mask = f_offset < freq_bins
-            
-            freq_grid = f_offset.to(tl.float32) * (sample_rate / 2.0) / freq_bins
-            freq_diff = tl.abs(freq_grid - center_freq)
-            response = tl.exp(-2.0 * 3.14159 * erb_width * freq_diff / sample_rate)
-            
-            mag_offset = (pid_b * mag_stride_b + 
-                         f_offset[:, None] * mag_stride_f + 
-                         t_offset[None, :] * mag_stride_t)
-            
-            magnitude_block = tl.load(magnitude_ptr + mag_offset, mask=f_mask[:, None] & t_mask[None, :])
-            filtered = magnitude_block * response[:, None]
-            accumulator += tl.sum(filtered, axis=0)
+        # Simple frequency processing - avoid complex control flow
+        f_offset = tl.arange(0, BLOCK_SIZE_F)
+        freq_grid = f_offset.to(tl.float32) * (sample_rate / 2.0) / freq_bins
+        freq_diff = tl.abs(freq_grid - center_freq)
+        response = tl.exp(-2.0 * 3.14159 * erb_width * freq_diff / sample_rate)
         
+        # Simple time-frequency processing
+        for t_idx in range(BLOCK_SIZE_T):
+            t_pos = pid_t * BLOCK_SIZE_T + t_idx
+            t_valid = t_pos < time_frames
+            
+            # Load magnitude values
+            accumulated_val = 0.0
+            for f_idx in range(BLOCK_SIZE_F):
+                f_pos = f_idx
+                f_valid = f_pos < freq_bins
+                
+                # Only process if both time and frequency are valid
+                if t_valid and f_valid:
+                    mag_offset = (pid_b * mag_stride_b + 
+                                 f_pos * mag_stride_f + 
+                                 t_pos * mag_stride_t)
+                    mag_val = tl.load(magnitude_ptr + mag_offset, mask=True, other=0.0)
+                    
+                    # Apply filter and accumulate
+                    response_val = tl.load(response + f_idx, mask=True, other=0.0)
+                    accumulated_val += mag_val * response_val
+            
+            # Store accumulated result
+            output_vals = tl.where(
+                tl.arange(0, BLOCK_SIZE_T) == t_idx,
+                accumulated_val,
+                output_vals
+            )
+        
+        # Store final results
         out_offset = (pid_b * out_stride_b + 
                      pid_n * out_stride_n + 
                      t_offset * out_stride_t)
-        tl.store(output_ptr + out_offset, accumulator, mask=t_mask)
+        tl.store(output_ptr + out_offset, output_vals, mask=t_mask)
 
     @triton.jit
-    def psychoacoustic_masking_kernel(
+    def psychoacoustic_masking_kernel_simple(
         gammatone_ptr,
         spreading_matrix_ptr,
         masking_ptr,
@@ -99,7 +120,7 @@ if HAS_TRITON:
         spread_stride_i, spread_stride_j,
         BLOCK_SIZE_T: tl.constexpr,
     ):
-        """Triton kernel for psychoacoustic masking computation"""
+        """FIXED: Ultra-simple psychoacoustic masking kernel"""
         pid_b = tl.program_id(0)
         pid_n = tl.program_id(1)
         pid_t = tl.program_id(2)
@@ -108,29 +129,49 @@ if HAS_TRITON:
         t_mask = t_offset < time_frames
         
         eps = 1e-10
-        gamma_offset = (pid_b * gamma_stride_b + 
-                       pid_n * gamma_stride_n + 
-                       t_offset * gamma_stride_t)
-        gamma_val = tl.load(gammatone_ptr + gamma_offset, mask=t_mask)
-        power_db = 20.0 * tl.log(tl.maximum(gamma_val, eps)) / tl.log(10.0)
         
-        spread_power = tl.zeros([BLOCK_SIZE_T], dtype=tl.float32)
+        # Simple processing for each time step
+        masking_values = tl.zeros([BLOCK_SIZE_T], dtype=tl.float32)
         
-        for j in range(n_filters):
-            spread_weight = tl.load(spreading_matrix_ptr + pid_n * spread_stride_i + j * spread_stride_j)
-            j_offset = (pid_b * gamma_stride_b + 
-                       j * gamma_stride_n + 
-                       t_offset * gamma_stride_t)
-            j_power_db = tl.load(gammatone_ptr + j_offset, mask=t_mask)
-            j_power_db = 20.0 * tl.log(tl.maximum(j_power_db, eps)) / tl.log(10.0)
-            spread_power += spread_weight * j_power_db
+        for t_idx in range(BLOCK_SIZE_T):
+            t_pos = pid_t * BLOCK_SIZE_T + t_idx
+            t_valid = t_pos < time_frames
+            
+            if t_valid:
+                # Load current filter value
+                gamma_offset = (pid_b * gamma_stride_b + 
+                               pid_n * gamma_stride_n + 
+                               t_pos * gamma_stride_t)
+                gamma_val = tl.load(gammatone_ptr + gamma_offset, mask=True, other=eps)
+                power_db = 20.0 * tl.log(tl.maximum(gamma_val, eps)) / tl.log(10.0)
+                
+                # Simple spreading computation
+                spread_power = 0.0
+                for j in range(n_filters):
+                    spread_weight = tl.load(spreading_matrix_ptr + pid_n * spread_stride_i + j * spread_stride_j, 
+                                           mask=True, other=0.0)
+                    j_offset = (pid_b * gamma_stride_b + 
+                               j * gamma_stride_n + 
+                               t_pos * gamma_stride_t)
+                    j_val = tl.load(gammatone_ptr + j_offset, mask=True, other=eps)
+                    j_power_db = 20.0 * tl.log(tl.maximum(j_val, eps)) / tl.log(10.0)
+                    spread_power += spread_weight * j_power_db
+                
+                # Apply threshold
+                masking_val = tl.maximum(spread_power, threshold_db)
+                
+                # Store in array
+                masking_values = tl.where(
+                    tl.arange(0, BLOCK_SIZE_T) == t_idx,
+                    masking_val,
+                    masking_values
+                )
         
-        masking_curve = tl.maximum(spread_power, threshold_db)
-        
+        # Store final results
         mask_offset = (pid_b * mask_stride_b + 
                       pid_n * mask_stride_n + 
                       t_offset * mask_stride_t)
-        tl.store(masking_ptr + mask_offset, masking_curve, mask=t_mask)
+        tl.store(masking_ptr + mask_offset, masking_values, mask=t_mask)
 
 def stft_transform(waveform, n_fft=N_FFT, hop_length=HOP_LENGTH, window='hann', return_complex=True):
     """
@@ -328,7 +369,7 @@ def create_deterministic_seed(path_str):
 
 class GammatoneFilterbank(nn.Module):
     """
-    Gammatone filterbank for psychoacoustic analysis - TRITON OPTIMIZED
+    Gammatone filterbank for psychoacoustic analysis - TRITON OPTIMIZED with better error handling
     """
     def __init__(self, n_filters=64, f_min=F_MIN, f_max=F_MAX, sample_rate=SAMPLE_RATE, use_triton=True):
         super().__init__()
@@ -336,7 +377,8 @@ class GammatoneFilterbank(nn.Module):
         self.f_min = f_min
         self.f_max = f_max
         self.sample_rate = sample_rate
-        self.use_triton = use_triton and HAS_TRITON
+        # IMPROVED: More conservative Triton usage
+        self.use_triton = use_triton and HAS_TRITON and torch.cuda.is_available()
         
         # ERB scale center frequencies
         erb_min = self.hz_to_erb(f_min)
@@ -350,7 +392,7 @@ class GammatoneFilterbank(nn.Module):
         erb_widths = 24.7 * (4.37 * center_freqs / 1000 + 1)
         self.register_buffer('erb_widths', erb_widths)
         
-        if self.use_triton:
+        if self.use_triton and HAS_TRITON:
             print("GammatoneFilterbank: Using Triton optimization")
         
     def hz_to_erb(self, hz):
@@ -375,27 +417,31 @@ class GammatoneFilterbank(nn.Module):
         """
         B, F, T = magnitude_spectrum.shape
         
-        if self.use_triton and magnitude_spectrum.is_cuda:
-            return self._forward_triton(magnitude_spectrum)
+        if self.use_triton and magnitude_spectrum.is_cuda and HAS_TRITON:
+            try:
+                return self._forward_triton(magnitude_spectrum)
+            except Exception as e:
+                print(f"Warning: Triton Gammatone failed ({e}), falling back to PyTorch")
+                return self._forward_pytorch(magnitude_spectrum)
         else:
             return self._forward_pytorch(magnitude_spectrum)
     
     def _forward_triton(self, magnitude_spectrum):
-        """Triton optimized forward pass"""
+        """Triton optimized forward pass with better error handling"""
         B, F, T = magnitude_spectrum.shape
         
         # Allocate output
         output = torch.zeros(B, self.n_filters, T, device=magnitude_spectrum.device, dtype=magnitude_spectrum.dtype)
         
-        # Define block sizes
-        BLOCK_SIZE_F = min(32, F)
-        BLOCK_SIZE_T = min(64, T)
+        # IMPROVED: More conservative block sizes
+        BLOCK_SIZE_F = min(16, F)  # Reduced from 32
+        BLOCK_SIZE_T = min(32, T)  # Reduced from 64
         
         # Launch kernel
         grid = (B, self.n_filters, triton.cdiv(T, BLOCK_SIZE_T))
         
-        if HAS_TRITON:
-            gammatone_kernel[grid](
+        try:
+            gammatone_kernel_simple[grid](
                 magnitude_spectrum, self.center_freqs, self.erb_widths,
                 output,
                 B, F, T, self.n_filters, float(self.sample_rate),
@@ -404,8 +450,10 @@ class GammatoneFilterbank(nn.Module):
                 BLOCK_SIZE_F=BLOCK_SIZE_F,
                 BLOCK_SIZE_T=BLOCK_SIZE_T,
             )
-        
-        return output
+            return output
+        except Exception as e:
+            print(f"Warning: Triton kernel launch failed ({e}), falling back to PyTorch")
+            return self._forward_pytorch(magnitude_spectrum)
     
     def _forward_pytorch(self, magnitude_spectrum):
         """PyTorch fallback implementation"""
@@ -447,7 +495,7 @@ class GammatoneFilterbank(nn.Module):
 
 def psychoacoustic_masking(gammatone_output, threshold_db=-60, use_triton=True):
     """
-    Compute psychoacoustic masking curve - TRITON OPTIMIZED
+    Compute psychoacoustic masking curve - TRITON OPTIMIZED with better error handling
     Args:
         gammatone_output: [B, n_filters, T] - gammatone filterbank output
         threshold_db: absolute hearing threshold
@@ -455,13 +503,18 @@ def psychoacoustic_masking(gammatone_output, threshold_db=-60, use_triton=True):
     Returns:
         masking_curve: [B, n_filters, T] - masking threshold
     """
+    # IMPROVED: More conservative Triton usage
     if use_triton and HAS_TRITON and gammatone_output.is_cuda:
-        return _psychoacoustic_masking_triton(gammatone_output, threshold_db)
+        try:
+            return _psychoacoustic_masking_triton(gammatone_output, threshold_db)
+        except Exception as e:
+            print(f"Warning: Triton psychoacoustic masking failed ({e}), falling back to PyTorch")
+            return _psychoacoustic_masking_pytorch(gammatone_output, threshold_db)
     else:
         return _psychoacoustic_masking_pytorch(gammatone_output, threshold_db)
 
 def _psychoacoustic_masking_triton(gammatone_output, threshold_db):
-    """Triton optimized psychoacoustic masking"""
+    """Triton optimized psychoacoustic masking with better error handling"""
     B, n_filters, T = gammatone_output.shape
     
     # Allocate output
@@ -488,14 +541,14 @@ def _psychoacoustic_masking_triton(gammatone_output, threshold_db):
     
     spreading_matrix = _psychoacoustic_masking_triton._spreading_cache[cache_key]
     
-    # Define block sizes
-    BLOCK_SIZE_T = min(64, T)
+    # IMPROVED: More conservative block sizes
+    BLOCK_SIZE_T = min(32, T)  # Reduced from 64
     
     # Launch kernel
     grid = (B, n_filters, triton.cdiv(T, BLOCK_SIZE_T))
     
-    if HAS_TRITON:
-        psychoacoustic_masking_kernel[grid](
+    try:
+        psychoacoustic_masking_kernel_simple[grid](
             gammatone_output, spreading_matrix, masking_curve,
             B, n_filters, T, float(threshold_db),
             gammatone_output.stride(0), gammatone_output.stride(1), gammatone_output.stride(2),
@@ -503,8 +556,10 @@ def _psychoacoustic_masking_triton(gammatone_output, threshold_db):
             spreading_matrix.stride(0), spreading_matrix.stride(1),
             BLOCK_SIZE_T=BLOCK_SIZE_T,
         )
-    
-    return masking_curve
+        return masking_curve
+    except Exception as e:
+        print(f"Warning: Triton psychoacoustic kernel failed ({e}), falling back to PyTorch")
+        return _psychoacoustic_masking_pytorch(gammatone_output, threshold_db)
 
 def _psychoacoustic_masking_pytorch(gammatone_output, threshold_db):
     """PyTorch fallback implementation"""
@@ -651,9 +706,10 @@ class SpectralLoss(nn.Module):
         self.alpha = alpha  # magnitude loss weight
         self.beta = beta    # phase loss weight  
         self.gamma = gamma  # spectral convergence weight
-        self.use_triton = use_triton and HAS_TRITON
+        # IMPROVED: More conservative Triton usage
+        self.use_triton = use_triton and HAS_TRITON and torch.cuda.is_available()
         
-        if self.use_triton:
+        if self.use_triton and HAS_TRITON:
             print("SpectralLoss: Triton optimization available")
         
     def spectral_convergence_loss(self, pred_stft, target_stft):

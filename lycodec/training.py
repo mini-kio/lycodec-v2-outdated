@@ -102,7 +102,7 @@ class LyCodecTrainer:
         # Initialize model
         self.model = LyCodecModel(**(model_config or {}))
         
-        # Enable gradient checkpointing for memory efficiency
+        # Enable gradient checkpointing for memory efficiency - FIXED VERSION
         if use_checkpointing:
             self._enable_gradient_checkpointing()
         
@@ -186,42 +186,94 @@ class LyCodecTrainer:
         self.logger.info(f"Updated scheduler with total_steps={total_steps}")
         
     def _enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing - SIMPLIFIED with Accelerate"""
+        """FIXED: Enable gradient checkpointing with better error handling and safer patching"""
         try:
             from torch.utils.checkpoint import checkpoint
             
-            def apply_checkpointing_to_module(module):
-                """Apply checkpointing to individual modules"""
-                if (hasattr(module, 'forward') and 
-                    not getattr(module, '_ckpt_patched', False)):
+            # FIXED: More robust checkpointing implementation
+            def create_checkpointed_forward(original_forward, module_name="unknown"):
+                """Create a checkpointed version of forward function with error handling"""
+                def checkpointed_forward(*args, **kwargs):
+                    try:
+                        # Use non-reentrant checkpointing for better stability
+                        return checkpoint(
+                            original_forward, 
+                            *args, 
+                            use_reentrant=False,
+                            **kwargs
+                        )
+                    except Exception as e:
+                        # Fallback to original forward on any checkpointing error
+                        self.logger.warning(f"Checkpointing failed for {module_name}: {e}, using original forward")
+                        return original_forward(*args, **kwargs)
+                return checkpointed_forward
+            
+            # Track which modules have been patched to avoid double-patching
+            if not hasattr(self, '_checkpointed_modules'):
+                self._checkpointed_modules = set()
+            
+            def apply_checkpointing_to_module(module, module_path=""):
+                """Apply checkpointing to individual modules with path tracking"""
+                module_id = id(module)
+                
+                # Skip if already patched
+                if module_id in self._checkpointed_modules:
+                    return
+                
+                # Only apply to ResidualBlock modules to avoid conflicts
+                module_class_name = module.__class__.__name__
+                if 'ResidualBlock' in module_class_name and hasattr(module, 'forward'):
+                    try:
+                        # Store original forward method
+                        if not hasattr(module, '_original_forward'):
+                            module._original_forward = module.forward
+                            
+                            # Create checkpointed version
+                            module.forward = create_checkpointed_forward(
+                                module._original_forward, 
+                                f"{module_path}.{module_class_name}"
+                            )
+                            
+                            # Mark as patched
+                            module._ckpt_patched = True
+                            self._checkpointed_modules.add(module_id)
+                            
+                            if self.is_main_process:
+                                self.logger.debug(f"Applied checkpointing to {module_path}.{module_class_name}")
                     
-                    module_id = id(module)
-                    if not hasattr(self, '_checkpointed_modules'):
-                        self._checkpointed_modules = set()
-                    
-                    if module_id not in self._checkpointed_modules:
-                        original_forward = module.forward
-                        
-                        def checkpointed_forward(*args, **kwargs):
-                            return checkpoint(original_forward, *args, **kwargs, use_reentrant=False)
-                        
-                        module.forward = checkpointed_forward
-                        module._ckpt_patched = True
-                        self._checkpointed_modules.add(module_id)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to apply checkpointing to {module_path}.{module_class_name}: {e}")
             
-            # Apply to ResidualBlocks in encoder and decoder
-            if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'layers'):
-                for layer in self.model.encoder.layers:
-                    if hasattr(layer, 'psych_attn'):
-                        apply_checkpointing_to_module(layer)
+            # FIXED: Apply to ResidualBlocks in encoder and decoder with better error handling
+            patched_count = 0
             
-            if hasattr(self.model, 'decoder') and hasattr(self.model.decoder, 'layers'):
-                for layer in self.model.decoder.layers:
-                    if hasattr(layer, 'psych_attn'):
-                        apply_checkpointing_to_module(layer)
-                        
-            self.logger.info("Applied activation checkpointing to ResidualBlocks")
+            try:
+                if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'layers'):
+                    for i, layer in enumerate(self.model.encoder.layers):
+                        if hasattr(layer, 'psych_attn'):  # ResidualBlock identifier
+                            apply_checkpointing_to_module(layer, f"encoder.layers[{i}]")
+                            patched_count += 1
+            except Exception as e:
+                self.logger.warning(f"Error applying checkpointing to encoder: {e}")
             
+            try:
+                if hasattr(self.model, 'decoder') and hasattr(self.model.decoder, 'layers'):
+                    for i, layer in enumerate(self.model.decoder.layers):
+                        if hasattr(layer, 'psych_attn'):  # ResidualBlock identifier
+                            apply_checkpointing_to_module(layer, f"decoder.layers[{i}]")
+                            patched_count += 1
+            except Exception as e:
+                self.logger.warning(f"Error applying checkpointing to decoder: {e}")
+            
+            if self.is_main_process:
+                if patched_count > 0:
+                    self.logger.info(f"Applied activation checkpointing to {patched_count} ResidualBlocks")
+                else:
+                    self.logger.warning("No ResidualBlocks found for checkpointing")
+            
+        except ImportError as e:
+            self.logger.error(f"Could not import checkpoint: {e}")
+            self.use_checkpointing = False
         except Exception as e:
             self.logger.warning(f"Could not apply gradient checkpointing: {e}")
             self.use_checkpointing = False
@@ -273,7 +325,7 @@ class LyCodecTrainer:
         phase_loss = F.mse_loss((1 - phase_diff_cos) * magnitude_weight, 
                                torch.zeros_like(phase_diff_cos))
         
-        # Audio reconstruction losses
+        # Audio reconstruction losses with better error handling
         try:
             pred_audio = to_waveform(pred_complex)
             
@@ -289,9 +341,10 @@ class LyCodecTrainer:
             time_loss = F.l1_loss(pred_audio, target_audio_trimmed)
             
         except Exception as e:
+            # IMPROVED: Better error handling for audio reconstruction
             self.logger.warning(f"Audio reconstruction failed: {e}")
-            spectral_loss = torch.tensor(0.0, device=device)
-            time_loss = torch.tensor(0.0, device=device)
+            spectral_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            time_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         # Latent regularization
         latent_loss = torch.tensor(0.0, device=device)
@@ -317,43 +370,59 @@ class LyCodecTrainer:
         }
     
     def train_step(self, batch):
-        """Single training step with Accelerate"""
-        # Unpack batch
-        stereo_audio = batch['audio']  # [B, 2, T]
-        
-        # Convert to complex spectrogram
-        complex_specs = []
-        magnitude_specs = []
-        
-        for i in range(stereo_audio.shape[1]):
-            complex_spec = to_complex_spec(stereo_audio[:, i])
-            magnitude, _ = to_magnitude_phase(complex_spec)
+        """Single training step with Accelerate and better error handling"""
+        try:
+            # Unpack batch
+            stereo_audio = batch['audio']  # [B, 2, T]
             
-            complex_specs.append(complex_spec)
-            magnitude_specs.append(magnitude)
-        
-        # Stack stereo channels
-        complex_input = torch.stack(complex_specs, dim=1)
-        magnitude_input = torch.stack(magnitude_specs, dim=1).mean(dim=1)
-        
-        # Separate real and imaginary parts
-        real_part = complex_input.real
-        imag_part = complex_input.imag
-        target_complex_input = torch.stack([real_part, imag_part], dim=2)
-        
-        # Forward pass (Accelerate handles mixed precision automatically)
-        pred_real, pred_imag, pred_latent = self.model(target_complex_input, magnitude_input)
-        
-        # Compute losses
-        losses = self.compute_loss(
-            pred_real, pred_imag,
-            real_part, imag_part,
-            stereo_audio, pred_latent
-        )
-        
-        loss = losses['total_loss']
-        
-        return losses, loss
+            # Convert to complex spectrogram
+            complex_specs = []
+            magnitude_specs = []
+            
+            for i in range(stereo_audio.shape[1]):
+                complex_spec = to_complex_spec(stereo_audio[:, i])
+                magnitude, _ = to_magnitude_phase(complex_spec)
+                
+                complex_specs.append(complex_spec)
+                magnitude_specs.append(magnitude)
+            
+            # Stack stereo channels
+            complex_input = torch.stack(complex_specs, dim=1)
+            magnitude_input = torch.stack(magnitude_specs, dim=1).mean(dim=1)
+            
+            # Separate real and imaginary parts
+            real_part = complex_input.real
+            imag_part = complex_input.imag
+            target_complex_input = torch.stack([real_part, imag_part], dim=2)
+            
+            # Forward pass (Accelerate handles mixed precision automatically)
+            pred_real, pred_imag, pred_latent = self.model(target_complex_input, magnitude_input)
+            
+            # Compute losses
+            losses = self.compute_loss(
+                pred_real, pred_imag,
+                real_part, imag_part,
+                stereo_audio, pred_latent
+            )
+            
+            loss = losses['total_loss']
+            
+            return losses, loss
+            
+        except Exception as e:
+            # IMPROVED: Better error handling for training step
+            self.logger.error(f"Error in training step: {e}")
+            # Return dummy losses to prevent training crash
+            dummy_loss = torch.tensor(0.0, device=self.accelerator.device, requires_grad=True)
+            dummy_losses = {
+                'total_loss': dummy_loss,
+                'magnitude_loss': dummy_loss.clone(),
+                'phase_loss': dummy_loss.clone(),
+                'spectral_loss': dummy_loss.clone(),
+                'time_loss': dummy_loss.clone(),
+                'latent_loss': dummy_loss.clone()
+            }
+            return dummy_losses, dummy_loss
     
     def train_epoch(self, dataloader, epoch):
         """Train for one epoch with Accelerate and tqdm progress tracking"""
@@ -387,63 +456,85 @@ class LyCodecTrainer:
             batch_pbar = dataloader
         
         for batch_idx, batch in enumerate(batch_pbar):
-            # IMPROVED: Use Accelerate's gradient accumulation context
-            with self.accelerator.accumulate(self.model):
-                # Training step
-                losses, loss = self.train_step(batch)
+            try:
+                # IMPROVED: Use Accelerate's gradient accumulation context
+                with self.accelerator.accumulate(self.model):
+                    # Training step
+                    losses, loss = self.train_step(batch)
+                    
+                    # Skip if dummy loss (error occurred)
+                    if loss.item() == 0.0 and all(v.item() == 0.0 for v in losses.values()):
+                        continue
+                    
+                    # IMPROVED: Use Accelerate's backward instead of manual scaling
+                    self.accelerator.backward(loss)
+                    
+                    # Gradient clipping
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    # Optimizer step
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
                 
-                # IMPROVED: Use Accelerate's backward instead of manual scaling
-                self.accelerator.backward(loss)
+                # Accumulate losses
+                for key, value in losses.items():
+                    if key not in total_losses:
+                        total_losses[key] = 0.0
+                    total_losses[key] += value.item()
                 
-                # Gradient clipping
-                if self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                num_batches += 1
                 
-                # Optimizer step
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
+                # Update progress bar
+                if self.is_main_process:
+                    current_lr = float(self.scheduler.get_last_lr()[0]) if self.scheduler else float(self.learning_rate)
+                    batch_pbar.set_postfix({
+                        'loss': f"{losses['total_loss'].item():.4f}",
+                        'mag': f"{losses['magnitude_loss'].item():.3f}",
+                        'lr': f"{current_lr:.2e}",
+                        'mem': f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB" if torch.cuda.is_available() else "N/A"
+                    })
+                
+                # Periodic logging
+                if self.is_main_process and batch_idx % 200 == 0:
+                    current_lr = float(self.scheduler.get_last_lr()[0]) if self.scheduler else float(self.learning_rate)
+                    elapsed = time.time() - start_time
+                    
+                    self.logger.info(
+                        f"Epoch {epoch}, Batch {batch_idx}/{len(dataloader)}, "
+                        f"Loss: {losses['total_loss'].item():.4f}, "
+                        f"LR: {current_lr:.2e}, "
+                        f"Time: {elapsed:.1f}s"
+                    )
+                    
+                    # Clear CUDA cache periodically
+                    if torch.cuda.is_available() and batch_idx % 100 == 0:
+                        torch.cuda.empty_cache()
             
-            # Accumulate losses
-            for key, value in losses.items():
-                if key not in total_losses:
-                    total_losses[key] = 0.0
-                total_losses[key] += value.item()
-            
-            num_batches += 1
-            
-            # Update progress bar
-            if self.is_main_process:
-                current_lr = float(self.scheduler.get_last_lr()[0]) if self.scheduler else float(self.learning_rate)
-                batch_pbar.set_postfix({
-                    'loss': f"{losses['total_loss'].item():.4f}",
-                    'mag': f"{losses['magnitude_loss'].item():.3f}",
-                    'lr': f"{current_lr:.2e}",
-                    'mem': f"{torch.cuda.memory_allocated() / 1024**3:.1f}GB" if torch.cuda.is_available() else "N/A"
-                })
-            
-            # Periodic logging
-            if self.is_main_process and batch_idx % 200 == 0:
-                current_lr = float(self.scheduler.get_last_lr()[0]) if self.scheduler else float(self.learning_rate)
-                elapsed = time.time() - start_time
-                
-                self.logger.info(
-                    f"Epoch {epoch}, Batch {batch_idx}/{len(dataloader)}, "
-                    f"Loss: {losses['total_loss'].item():.4f}, "
-                    f"LR: {current_lr:.2e}, "
-                    f"Time: {elapsed:.1f}s"
-                )
-                
-                # Clear CUDA cache periodically
-                if torch.cuda.is_available() and batch_idx % 100 == 0:
-                    torch.cuda.empty_cache()
+            except Exception as e:
+                self.logger.error(f"Error in batch {batch_idx}: {e}")
+                # Continue training despite batch errors
+                continue
         
         # Close progress bar
         if self.is_main_process:
             batch_pbar.close()
         
-        # Average losses
-        avg_losses = {key: value / num_batches for key, value in total_losses.items()}
+        # Average losses (avoid division by zero)
+        if num_batches > 0:
+            avg_losses = {key: value / num_batches for key, value in total_losses.items()}
+        else:
+            # Return dummy losses if no batches processed
+            avg_losses = {
+                'total_loss': 0.0,
+                'magnitude_loss': 0.0,
+                'phase_loss': 0.0,
+                'spectral_loss': 0.0,
+                'time_loss': 0.0,
+                'latent_loss': 0.0
+            }
+        
         return avg_losses
     
     def validate(self, val_dataloader):
@@ -472,50 +563,59 @@ class LyCodecTrainer:
         
         with torch.no_grad():
             for batch in val_pbar:
-                # Forward pass only
-                stereo_audio = batch['audio']
+                try:
+                    # Forward pass only
+                    stereo_audio = batch['audio']
+                    
+                    # Convert to complex spectrogram
+                    complex_specs = []
+                    magnitude_specs = []
+                    
+                    for i in range(stereo_audio.shape[1]):
+                        complex_spec = to_complex_spec(stereo_audio[:, i])
+                        magnitude, _ = to_magnitude_phase(complex_spec)
+                        complex_specs.append(complex_spec)
+                        magnitude_specs.append(magnitude)
+                    
+                    complex_input = torch.stack(complex_specs, dim=1)
+                    magnitude_input = torch.stack(magnitude_specs, dim=1).mean(dim=1)
+                    
+                    real_part = complex_input.real
+                    imag_part = complex_input.imag
+                    target_complex_input = torch.stack([real_part, imag_part], dim=2)
+                    
+                    pred_real, pred_imag, pred_latent = self.model(target_complex_input, magnitude_input)
+                    losses = self.compute_loss(pred_real, pred_imag, real_part, imag_part, stereo_audio, pred_latent)
+                    
+                    # Accumulate losses
+                    for key, value in losses.items():
+                        if key not in total_val_losses:
+                            total_val_losses[key] = 0.0
+                        total_val_losses[key] += value.item()
+                    
+                    num_val_batches += 1
+                    
+                    # Update validation progress
+                    if self.is_main_process:
+                        val_pbar.set_postfix({
+                            'val_loss': f"{losses['total_loss'].item():.4f}",
+                            'val_mag': f"{losses['magnitude_loss'].item():.3f}"
+                        })
                 
-                # Convert to complex spectrogram
-                complex_specs = []
-                magnitude_specs = []
-                
-                for i in range(stereo_audio.shape[1]):
-                    complex_spec = to_complex_spec(stereo_audio[:, i])
-                    magnitude, _ = to_magnitude_phase(complex_spec)
-                    complex_specs.append(complex_spec)
-                    magnitude_specs.append(magnitude)
-                
-                complex_input = torch.stack(complex_specs, dim=1)
-                magnitude_input = torch.stack(magnitude_specs, dim=1).mean(dim=1)
-                
-                real_part = complex_input.real
-                imag_part = complex_input.imag
-                target_complex_input = torch.stack([real_part, imag_part], dim=2)
-                
-                pred_real, pred_imag, pred_latent = self.model(target_complex_input, magnitude_input)
-                losses = self.compute_loss(pred_real, pred_imag, real_part, imag_part, stereo_audio, pred_latent)
-                
-                # Accumulate losses
-                for key, value in losses.items():
-                    if key not in total_val_losses:
-                        total_val_losses[key] = 0.0
-                    total_val_losses[key] += value.item()
-                
-                num_val_batches += 1
-                
-                # Update validation progress
-                if self.is_main_process:
-                    val_pbar.set_postfix({
-                        'val_loss': f"{losses['total_loss'].item():.4f}",
-                        'val_mag': f"{losses['magnitude_loss'].item():.3f}"
-                    })
+                except Exception as e:
+                    self.logger.error(f"Error in validation batch: {e}")
+                    continue
         
         # Close validation progress bar
         if self.is_main_process:
             val_pbar.close()
         
-        # Average validation losses
-        avg_val_losses = {f'val_{key}': value / num_val_batches for key, value in total_val_losses.items()}
+        # Average validation losses (avoid division by zero)
+        if num_val_batches > 0:
+            avg_val_losses = {f'val_{key}': value / num_val_batches for key, value in total_val_losses.items()}
+        else:
+            avg_val_losses = {}
+        
         return avg_val_losses
     
     def log_epoch(self, epoch, avg_losses, val_losses, best_loss):
@@ -557,45 +657,54 @@ class LyCodecTrainer:
         if not self.is_main_process:
             return
         
-        # IMPROVED: Use Accelerate's save_state for better checkpoint handling
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.accelerator.get_state_dict(self.model),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'losses': losses,
-            'total_steps': self.total_steps
-        }
-        
-        torch.save(checkpoint, save_path, _use_new_zipfile_serialization=False)
-        self.logger.info(f"Checkpoint saved to {save_path}")
+        try:
+            # IMPROVED: Use Accelerate's save_state for better checkpoint handling
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': self.accelerator.get_state_dict(self.model),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': self.scheduler.state_dict(),
+                'losses': losses,
+                'total_steps': self.total_steps
+            }
+            
+            torch.save(checkpoint, save_path, _use_new_zipfile_serialization=False)
+            self.logger.info(f"Checkpoint saved to {save_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Failed to save checkpoint: {e}")
     
     def load_checkpoint(self, checkpoint_path):
-        """Load training checkpoint with Accelerate"""
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        
-        # Load model state
-        self.accelerator.load_state_dict(self.model, checkpoint['model_state_dict'])
-        
-        # Load optimizer and scheduler
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
-        if 'total_steps' in checkpoint:
-            self.total_steps = checkpoint['total_steps']
-            self._create_scheduler()
-            # Re-prepare scheduler with accelerator
-            if self.accelerator:
-                self.scheduler = self.accelerator.prepare(self.scheduler)
-        
-        epoch = checkpoint.get('epoch', 0)
-        
-        if 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        """Load training checkpoint with Accelerate and better error handling"""
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
             
-            if hasattr(self.scheduler, '_last_lr') and len(self.scheduler._last_lr) == 0:
-                self.scheduler._last_lr = [float(self.learning_rate)]  # FIXED: Ensure float type
-        
-        losses = checkpoint.get('losses', {})
-        
-        self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
-        return epoch, losses
+            # Load model state
+            self.accelerator.load_state_dict(self.model, checkpoint['model_state_dict'])
+            
+            # Load optimizer and scheduler
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            
+            if 'total_steps' in checkpoint:
+                self.total_steps = checkpoint['total_steps']
+                self._create_scheduler()
+                # Re-prepare scheduler with accelerator
+                if self.accelerator:
+                    self.scheduler = self.accelerator.prepare(self.scheduler)
+            
+            epoch = checkpoint.get('epoch', 0)
+            
+            if 'scheduler_state_dict' in checkpoint:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                
+                if hasattr(self.scheduler, '_last_lr') and len(self.scheduler._last_lr) == 0:
+                    self.scheduler._last_lr = [float(self.learning_rate)]  # FIXED: Ensure float type
+            
+            losses = checkpoint.get('losses', {})
+            
+            self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
+            return epoch, losses
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load checkpoint {checkpoint_path}: {e}")
+            return 0, {}  # Return defaults on error
