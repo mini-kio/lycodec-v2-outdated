@@ -52,6 +52,12 @@ class LyCodecTrainer:
         # Initialize model
         self.model = LyCodecModel(**(model_config or {}))
         
+        # Setup distributed training if available (needed for is_main_process)
+        self._setup_distributed()
+        
+        # IMPROVED: Setup logging early so it's available for other methods
+        self._setup_logging()
+        
         # Enable gradient checkpointing for memory efficiency - IMPROVED SAFER METHOD
         if use_checkpointing:
             self._enable_gradient_checkpointing()
@@ -68,9 +74,6 @@ class LyCodecTrainer:
         self.spectral_loss = SpectralLoss(n_ffts=[512, 1024, 2048], alpha=1.0, beta=0.1)
         self.mse_loss = nn.MSELoss()
         
-        # Setup distributed training if available
-        self._setup_distributed()
-        
         # Optimizer with improved settings
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -83,10 +86,7 @@ class LyCodecTrainer:
         # Learning rate scheduler - will be updated with correct total_steps
         self.scheduler = None
         self._create_scheduler()
-        
-        # IMPROVED: Setup logging only for main process
-        self._setup_logging()
-        
+    
     def _setup_logging(self):
         """Setup logging only for main process to avoid duplicate logs - IMPROVED with rotation"""
         if self.is_main_process:
