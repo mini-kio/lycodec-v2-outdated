@@ -522,7 +522,10 @@ def dynamic_range_compression(magnitude, ratio=4.0, threshold=0.1, knee_width=0.
     return compressed
 
 class SpectralLoss(nn.Module):
-    """Multi-scale spectral loss for high-quality reconstruction - STABLE VERSION"""
+    """
+    Multi-scale spectral loss for high-quality reconstruction - STABLE VERSION
+    OPTIMIZED: Can work with complex spectrograms directly for spectrum-domain training
+    """
     def __init__(self, n_ffts=[512, 1024, 2048], alpha=1.0, beta=1.0, gamma=1.0, use_triton=False):
         super().__init__()
         self.n_ffts = n_ffts
@@ -532,7 +535,7 @@ class SpectralLoss(nn.Module):
         # Always use PyTorch implementation
         self.use_triton = False
         
-        print(f"✅ SpectralLoss: Using stable PyTorch implementation")
+        print(f"✅ SpectralLoss: Using stable PyTorch implementation with spectrum-domain support")
         
     def spectral_convergence_loss(self, pred_stft, target_stft):
         """Spectral convergence loss for better reconstruction"""
@@ -544,7 +547,69 @@ class SpectralLoss(nn.Module):
         
         return numerator / (denominator + 1e-8)
         
-    def forward(self, pred_audio, target_audio):
+    def forward(self, pred_input, target_input):
+        """
+        Forward pass supporting both audio and complex spectrogram inputs
+        OPTIMIZATION: Direct spectrum-domain loss to avoid expensive ISTFT
+        
+        Args:
+            pred_input: Either audio tensor [B, T] or complex spectrogram [B, F, T] or [B, C, F, T]
+            target_input: Either audio tensor [B, T] or complex spectrogram [B, F, T] or [B, C, F, T]
+        """
+        # Check if inputs are complex spectrograms
+        if torch.is_complex(pred_input) and torch.is_complex(target_input):
+            # OPTIMIZATION: Direct spectrum-domain loss computation
+            return self._spectrum_domain_loss(pred_input, target_input)
+        else:
+            # Traditional audio-domain loss
+            return self._audio_domain_loss(pred_input, target_input)
+    
+    def _spectrum_domain_loss(self, pred_complex, target_complex):
+        """
+        OPTIMIZED: Direct spectrum-domain loss without STFT computation
+        Works directly with complex spectrograms to avoid ISTFT overhead
+        """
+        total_loss = 0.0
+        
+        # Handle multi-channel input [B, C, F, T] -> process each channel
+        if pred_complex.dim() == 4:
+            for ch in range(pred_complex.shape[1]):
+                pred_ch = pred_complex[:, ch]  # [B, F, T]
+                target_ch = target_complex[:, ch]  # [B, F, T]
+                total_loss += self._compute_spectrum_loss(pred_ch, target_ch)
+            total_loss /= pred_complex.shape[1]  # Average over channels
+        else:
+            # Single channel [B, F, T]
+            total_loss = self._compute_spectrum_loss(pred_complex, target_complex)
+        
+        return total_loss
+    
+    def _compute_spectrum_loss(self, pred_stft, target_stft):
+        """Compute loss for a single spectrum"""
+        # Magnitude loss
+        pred_mag = torch.abs(pred_stft)
+        target_mag = torch.abs(target_stft)
+        mag_loss = F.l1_loss(pred_mag, target_mag)
+        
+        # Spectral convergence loss
+        sc_loss = self.spectral_convergence_loss(pred_stft, target_stft)
+        
+        # Phase loss (only where magnitude is significant)
+        magnitude_mask = target_mag > 0.01 * target_mag.max()
+        if magnitude_mask.any():
+            pred_phase = torch.angle(pred_stft)
+            target_phase = torch.angle(target_stft)
+            
+            # Use cosine distance for phase (better than MSE)
+            phase_diff_cos = torch.cos(pred_phase - target_phase)
+            phase_loss = 1.0 - phase_diff_cos[magnitude_mask].mean()
+        else:
+            phase_loss = torch.tensor(0.0, device=pred_stft.device)
+        
+        return self.alpha * mag_loss + self.beta * phase_loss + self.gamma * sc_loss
+    
+    def _audio_domain_loss(self, pred_audio, target_audio):
+        """Traditional multi-scale STFT loss on audio signals"""
         total_loss = 0.0
         
         for n_fft in self.n_ffts:

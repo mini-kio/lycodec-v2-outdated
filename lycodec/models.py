@@ -213,6 +213,7 @@ class ResidualBlock(nn.Module):
 class LyEncoder(nn.Module):
     """
     LyCodec Encoder: f10c10 compression (100x total) - STABLE PYTORCH VERSION
+    OPTIMIZED: Psychoacoustic processing only on first ResidualBlock
     """
     def __init__(self, in_channels=2, base_channels=64, latent_dim=64, n_layers=6, use_triton=False):
         super().__init__()
@@ -258,7 +259,7 @@ class LyEncoder(nn.Module):
         
         self.layers = nn.ModuleList(layers)
         
-        print(f"✅ LyEncoder: Using stable PyTorch implementation")
+        print(f"✅ LyEncoder: Using stable PyTorch implementation with psychoacoustic optimization")
         
     def forward(self, complex_spec, magnitude_spectrum=None):
         """
@@ -272,9 +273,13 @@ class LyEncoder(nn.Module):
         
         x = self.input_proj(x)
         
+        # OPTIMIZATION: Only use psychoacoustic attention on first ResidualBlock
         for i, layer in enumerate(self.layers):
             if isinstance(layer, ResidualBlock):
-                x = layer(x, magnitude_spectrum)
+                # 첫 블록에서만 psychoacoustic attention 활성화
+                # 이후 블록은 magnitude_spectrum=None 으로 전달해
+                # gammatone 계산을 다시 하지 않도록 한다.
+                x = layer(x, magnitude_spectrum if i == 0 else None)
             else:
                 x = layer(x)
                 
@@ -397,7 +402,7 @@ class LyCodecModel(nn.Module):
             use_triton=False
         )
         
-        print(f"✅ LyCodecModel: Stable PyTorch implementation (Triton disabled for V100×4 compatibility)")
+        print(f"✅ LyCodecModel: Stable PyTorch implementation (Triton disabled, psychoacoustic optimized)")
         
     def encode(self, complex_spec, magnitude_spectrum=None):
         return self.encoder(complex_spec, magnitude_spectrum)
@@ -406,7 +411,20 @@ class LyCodecModel(nn.Module):
         return self.decoder(latent, target_size)
     
     def forward(self, complex_spec, magnitude_spectrum=None):
-        """Full encode-decode cycle for training"""
+        """
+        Full encode-decode cycle for training
+        
+        CRITICAL: All outputs MUST contribute to loss for DDP compatibility.
+        This prevents "Expected to have finished reduction" errors.
+        """
         latent = self.encode(complex_spec, magnitude_spectrum)
         real_part, imag_part = self.decode(latent, complex_spec.shape[-2:])
+        
+        # CRITICAL: Ensure all outputs require gradients for DDP
+        # This is essential to prevent gradient synchronization issues
+        if self.training:
+            assert latent.requires_grad, "Latent must require gradients during training"
+            assert real_part.requires_grad, "Real part must require gradients during training"
+            assert imag_part.requires_grad, "Imaginary part must require gradients during training"
+        
         return real_part, imag_part, latent

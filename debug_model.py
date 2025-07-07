@@ -1,70 +1,139 @@
 #!/usr/bin/env python3
 """
-Minimal test to isolate the model forward pass issue
+Accelerate 설정 직접 수정 - DDP find_unused_parameters 추가
 """
 
-import torch
+import os
 import yaml
-from lycodec.models import LyCodecModel
-from lycodec.audio import to_complex_spec, to_magnitude_phase
+from pathlib import Path
 
-def test_model_forward():
-    """Test basic model forward pass"""
-    print("🔍 Loading config...")
-    with open('config.yaml', 'r') as f:
+def fix_accelerate_config():
+    """기존 Accelerate 설정에 ddp_kwargs 추가"""
+    
+    config_path = Path.home() / ".cache/huggingface/accelerate/default_config.yaml"
+    
+    print(f"🔧 Fixing Accelerate config at: {config_path}")
+    
+    if not config_path.exists():
+        print("❌ Config file not found!")
+        return False
+    
+    # 현재 설정 읽기
+    with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    print("🔍 Creating model...")
-    model_config = config.get('model', {})
-    model_config['use_triton'] = False
-    model = LyCodecModel(**model_config)
+    print("📋 Current config:")
+    for key, value in config.items():
+        print(f"   {key}: {value}")
     
-    if torch.cuda.is_available():
-        print(f"🔍 Moving model to CUDA...")
-        model = model.cuda()
+    # 백업 생성
+    backup_path = config_path.with_suffix('.yaml.backup')
+    with open(backup_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    print(f"💾 Backup saved: {backup_path}")
     
-    model.eval()
+    # ddp_kwargs 추가
+    config['ddp_kwargs'] = {
+        'find_unused_parameters': True,
+        'broadcast_buffers': True,
+        'bucket_cap_mb': 25
+    }
     
-    print("🔍 Creating test input...")
-    # Create dummy stereo audio: [batch=1, channels=2, time=220500]
-    dummy_audio = torch.randn(1, 2, 220500)
-    if torch.cuda.is_available():
-        dummy_audio = dummy_audio.cuda()
+    # mixed_precision을 no로 변경 (안정성을 위해)
+    config['mixed_precision'] = 'no'
     
-    print("🔍 Converting to complex spectrogram...")
-    complex_specs = []
-    magnitude_specs = []
+    # 수정된 설정 저장
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
     
-    for i in range(2):  # Stereo channels
-        complex_spec = to_complex_spec(dummy_audio[:, i])
-        magnitude, _ = to_magnitude_phase(complex_spec)
-        complex_specs.append(complex_spec)
-        magnitude_specs.append(magnitude)
+    print("\n✅ Fixed config:")
+    for key, value in config.items():
+        print(f"   {key}: {value}")
     
-    # Stack stereo channels
-    complex_input = torch.stack(complex_specs, dim=1)
-    magnitude_input = torch.stack(magnitude_specs, dim=1).mean(dim=1)
+    return True
+
+def create_emergency_accelerate_config():
+    """완전히 새로운 안전한 설정 생성"""
     
-    # Separate real and imaginary parts
-    real_part = complex_input.real
-    imag_part = complex_input.imag
-    target_complex_input = torch.stack([real_part, imag_part], dim=2)
+    config = {
+        'compute_environment': 'LOCAL_MACHINE',
+        'distributed_type': 'MULTI_GPU',
+        'downcast_bf16': 'no',
+        'gpu_ids': 'all',
+        'machine_rank': 0,
+        'main_training_function': 'main',
+        'mixed_precision': 'no',  # FP16 비활성화로 안정성 확보
+        'num_machines': 1,
+        'num_processes': 4,
+        'rdzv_backend': 'static',
+        'same_network': True,
+        'tpu_env': [],
+        'tpu_use_cluster': False,
+        'tpu_use_sudo': False,
+        'use_cpu': False,
+        'enable_cpu_affinity': False,
+        'debug': False,
+        'ddp_kwargs': {
+            'find_unused_parameters': True,
+            'broadcast_buffers': True,
+            'bucket_cap_mb': 25
+        }
+    }
     
-    print(f"🔍 Input shape: {target_complex_input.shape}")
-    print(f"🔍 Magnitude shape: {magnitude_input.shape}")
+    config_path = Path.home() / ".cache/huggingface/accelerate/default_config.yaml"
     
-    print("🔍 Testing model forward pass...")
-    with torch.no_grad():
-        try:
-            pred_real, pred_imag, pred_latent = model(target_complex_input, magnitude_input)
-            print(f"✅ Model forward completed!")
-            print(f"   pred_real shape: {pred_real.shape}")
-            print(f"   pred_imag shape: {pred_imag.shape}")
-            print(f"   pred_latent shape: {pred_latent.shape}")
-        except Exception as e:
-            print(f"❌ Model forward failed: {e}")
-            import traceback
-            traceback.print_exc()
+    # 원본 백업
+    if config_path.exists():
+        backup_path = config_path.with_suffix('.yaml.original')
+        config_path.rename(backup_path)
+        print(f"💾 Original config backed up: {backup_path}")
+    
+    # 새 설정 저장
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f, default_flow_style=False)
+    
+    print("✅ Created new safe Accelerate config")
+    return True
+
+def verify_config():
+    """설정 확인"""
+    config_path = Path.home() / ".cache/huggingface/accelerate/default_config.yaml"
+    
+    if not config_path.exists():
+        return False
+    
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    print("\n🔍 Verification:")
+    has_ddp = 'ddp_kwargs' in config
+    has_unused_params = has_ddp and config['ddp_kwargs'].get('find_unused_parameters', False)
+    
+    print(f"   ✅ ddp_kwargs present: {has_ddp}")
+    print(f"   ✅ find_unused_parameters: {has_unused_params}")
+    print(f"   ✅ mixed_precision: {config.get('mixed_precision', 'unknown')}")
+    
+    return has_ddp and has_unused_params
 
 if __name__ == '__main__':
-    test_model_forward()
+    print("🚨 DDP Configuration Fix")
+    print("=" * 40)
+    
+    # 1단계: 기존 설정 수정 시도
+    success = fix_accelerate_config()
+    
+    if not success:
+        print("\n🔄 Creating new configuration...")
+        success = create_emergency_accelerate_config()
+    
+    # 2단계: 설정 확인
+    if verify_config():
+        print("\n🎉 SUCCESS! Configuration fixed.")
+        print("\n🚀 Now run:")
+        print("   accelerate launch train.py --config config_emergency.yaml")
+    else:
+        print("\n❌ Configuration fix failed.")
+        print("\n🚀 Try single GPU instead:")
+        print("   export CUDA_VISIBLE_DEVICES=0")
+        print("   accelerate launch --num_processes=1 train.py --config config_emergency.yaml")

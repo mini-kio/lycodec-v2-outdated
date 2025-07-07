@@ -1,5 +1,5 @@
-# LyCodec v2.0 Training Configuration
-# Optimized for V100×4 16GB setup
+# LyCodec v2.0 Training Configuration - OPTIMIZED for V100×4 16GB
+# 최적화된 설정: 첫 번째 배치가 끝나지 않는 문제 해결
 
 # Random seed for reproducibility
 seed: 42
@@ -17,19 +17,19 @@ model:
   base_channels: 64                       # Base number of channels
   n_layers: 6                             # Number of encoder/decoder layers
 
-# Training configuration
+# Training configuration - OPTIMIZED for faster first batch
 training:
-  # Batch and memory settings (optimized for 16GB VRAM)
-  batch_size: 1                           # Reduced batch size to prevent OOM
-  accumulate_grad_batches: 16             # Increased accumulation to maintain effective batch size
-  num_workers: 0                          # Disable multiprocessing to test for deadlock
+  # OPTIMIZATION: 배치 크기 조정으로 메모리 사용량 최적화
+  batch_size: 1                           # 매우 작은 배치 크기로 메모리 절약
+  accumulate_grad_batches: 16             # 높은 accumulation으로 effective batch size 유지
+  num_workers: 0                          # Disable multiprocessing to prevent deadlock
   
   # Optimization
-  learning_rate: 0.0001                    # Peak learning rate (1e-4)
+  learning_rate: 0.0001                   # Peak learning rate (1e-4)
   num_epochs: 1000                        # Total training epochs
   
-  # Memory optimization
-  mixed_precision: false                  # Disable AMP to test for stability issues
+  # OPTIMIZATION: Mixed precision 비활성화로 안정성 향상
+  mixed_precision: false                  # 안정성을 위해 비활성화
   gradient_checkpointing: true            # Enable gradient checkpointing to save memory
   
   # Checkpointing
@@ -40,8 +40,8 @@ training:
 accelerate:
   # These settings are managed by Accelerate's config system
   # Run 'accelerate config' to set up distributed training
-  mixed_precision: "no"                   # Disable mixed precision to test stability
-  gradient_accumulation_steps: 4          # Should match training.accumulate_grad_batches
+  mixed_precision: "no"                   # 안정성을 위해 비활성화
+  gradient_accumulation_steps: 16         # Should match training.accumulate_grad_batches
   num_processes: 4                        # Number of GPUs to use
 
 # Audio processing configuration
@@ -51,9 +51,10 @@ audio:
   hop_length: 512                         # STFT hop length (f10 compression in time)
   n_mels: 128                             # Number of mel bands
   
-  # Psychoacoustic settings
+  # OPTIMIZATION: Psychoacoustic settings - 단일 패스 최적화
   n_gammatone_filters: 64                 # Gammatone filterbank size
   psychoacoustic_weight: 0.1              # Weight for psychoacoustic loss
+  single_psychoacoustic_pass: true        # 🔧 첫 번째 ResidualBlock에서만 처리
   
   # Audio normalization method
   normalize_method: "rms"                 # "rms", "peak", or "lufs"
@@ -64,13 +65,16 @@ compression:
   time_compression: 10                    # Time axis compression factor
   total_compression: 100                  # Total compression ratio
 
-# Loss function weights
+# Loss function weights - OPTIMIZED
 loss:
   magnitude_weight: 1.0                   # Magnitude spectrum loss
   phase_weight: 0.1                       # Phase loss
   spectral_weight: 0.5                    # Multi-scale spectral loss  
-  time_weight: 0.3                        # Time-domain loss
+  time_weight: 0.3                        # Time-domain loss (이제 spectrum proxy 사용)
   latent_weight: 0.01                     # Latent regularization
+  
+  # OPTIMIZATION: 스펙트럼 도메인 loss 사용
+  use_spectrum_domain_loss: true          # 🔧 ISTFT 없이 스펙트럼에서 직접 계산
   
 # Validation settings
 validation:
@@ -90,37 +94,63 @@ logging:
   log_every: 200                          # Log every N batches (reduced from 100)
   tensorboard_dir: "logs"                 # TensorBoard logs directory
   
-# Hardware optimization (V100×4 16GB optimized)
+# Hardware optimization (V100×4 16GB optimized) - 최적화된 설정
 hardware:
   # V100 specific optimizations
   use_tensor_cores: true                  # Enable Tensor Core usage for mixed precision
-  cudnn_benchmark: false                  # Disable for reproducibility, enable for speed after debugging
+  cudnn_benchmark: false                  # 🔧 재현성을 위해 비활성화 (디버깅 중)
   
-  # Memory management for 16GB cards (more aggressive)
-  empty_cache_every: 5                    # Clear CUDA cache every N batches (more frequent)
-  max_memory_fraction: 0.85               # More conservative for multi-process training
+  # OPTIMIZATION: 더 적극적인 메모리 관리
+  empty_cache_every: 5                    # 🔧 더 자주 CUDA 캐시 정리 (5배치마다)
+  max_memory_fraction: 0.85               # 더 보수적인 메모리 사용
   
   # V100 optimization flags
   torch_compile: false                    # PyTorch 2.0 compile (experimental)
   channels_last: false                    # Memory format optimization
   
-# Advanced features
+# Advanced features - OPTIMIZED
 advanced:
-  # Triton kernel optimizations (v2.0 optimized)
-  use_triton_kernels: true                # Enable custom Triton kernels for 2-3x speedup
+  # OPTIMIZATION: Triton 커널 비활성화로 안정성 확보
+  use_triton_kernels: false               # 🔧 V100×4에서 컴파일 오류 방지
   
   # Progressive training
   progressive_training: false             # Start with shorter sequences
   
-  # Perceptual optimization
+  # OPTIMIZATION: Perceptual optimization with single pass
   perceptual_loss: true                   # Enable perceptual loss
+  single_psychoacoustic_computation: true # 🔧 한 번만 계산하여 속도 향상
   
   # Dynamic loss scaling
   dynamic_loss_scaling: true              # Adaptive loss scaling for stability
 
-# WandB experiment tracking (v2.0)
+# WandB experiment tracking (v2.0) - OPTIMIZED
 wandb:
-  project: "lycodec-v2-training"          # Updated project name for v2
+  project: "lycodec-v2-optimized"         # 최적화 버전임을 명시
   entity: "your-team"                     # Your WandB team/username
   enabled: true                           # Enable WandB logging
-  tags: ["lycodec", "v2.0", "f10c10"]    # Tags for experiment organization
+  tags: ["lycodec", "v2.0", "f10c10", "optimized", "v100x4", "single-psycho-pass"]    # 최적화 태그 추가
+
+# OPTIMIZATION: 성능 최적화 설정들
+optimizations:
+  # 🔧 주요 최적화 플래그들
+  single_psychoacoustic_pass: true        # ResidualBlock 중 첫 번째에서만 psychoacoustic 처리
+  vectorized_stft_computation: true       # 스테레오 채널을 한 번에 STFT 계산
+  spectrum_domain_loss: true              # ISTFT 없이 스펙트럼 도메인에서 loss 계산
+  
+  # 메모리 최적화
+  aggressive_memory_management: true      # 적극적인 메모리 정리
+  reduced_batch_size: true                # 작은 배치 크기 사용
+  
+  # 성능 모니터링
+  profile_first_batch: false              # 첫 번째 배치 프로파일링 (디버깅용)
+  
+# TROUBLESHOOTING: 문제 해결을 위한 디버그 설정
+debug:
+  # 첫 번째 배치가 끝나지 않는 문제 디버깅
+  log_first_batch_progress: true          # 첫 번째 배치 진행상황 로깅
+  monitor_gpu_memory: true                # GPU 메모리 사용량 모니터링
+  profile_slow_operations: false          # 느린 연산 프로파일링 (필요시 활성화)
+  
+  # 안전 설정
+  max_batch_processing_time: 300          # 배치당 최대 처리 시간 (초)
+  emergency_stop_on_timeout: false       # 타임아웃 시 긴급 정지 (필요시 활성화)
