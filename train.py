@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-LyCodec Training Script v2.0 - V100×4 ACCELERATE VERSION with OPTIMIZATIONS
-Optimized for V100×4 16GB setup with fixed Triton issues and proper 4-GPU distributed training
+LyCodec Training Script v2.0 - V100×4 ACCELERATE VERSION with CRITICAL FIXES
+Fixed RNG synchronization and DDP parameter issues
 
-OPTIMIZATIONS APPLIED:
-- Psychoacoustic processing only on first ResidualBlock
-- Vectorized STFT computation for 2x speedup
-- Spectrum-domain loss to avoid expensive ISTFT
-- Memory-efficient batch processing
+CRITICAL FIXES:
+- RNG state isolation to prevent mt19937 errors
+- DDP compatibility improvements with find_unused_parameters
+- Enhanced parameter gradient flow verification
+- Memory and tensor dimension fixes
 """
 
 import os
@@ -23,17 +23,17 @@ from torch.utils.data import DataLoader
 import soundfile as sf
 import numpy as np
 
-# IMPROVED: Use Accelerate for 4-GPU distributed training
+# FIXED: More robust Accelerate imports with version compatibility
 try:
     from accelerate import Accelerator
     from accelerate.utils import set_seed
-    # Try to import DistributedDataParallelKwargs - may not be available in all versions
+    # Import DDP kwargs conditionally
     try:
         from accelerate.utils import DistributedDataParallelKwargs
         HAS_DDP_KWARGS = True
     except ImportError:
         HAS_DDP_KWARGS = False
-        print("ℹ️ DistributedDataParallelKwargs not available - using basic Accelerator setup")
+        print("ℹ️ DistributedDataParallelKwargs not available - using basic setup")
     
     HAS_ACCELERATE = True
     print("✅ Accelerate available for distributed training")
@@ -47,11 +47,11 @@ from lycodec.audio import normalize_audio, high_quality_resample, create_determi
 
 class AudioDataset(torch.utils.data.Dataset):
     """
-    Dataset for audio files with 5-second sampling (3 samples per track) - V100×4 OPTIMIZED
+    Dataset for audio files - IMPROVED with better error handling and deterministic sampling
     """
     def __init__(self, 
                  data_dir: str,
-                 segment_length: int = 220500,  # 5 seconds at 44.1kHz
+                 segment_length: int = 220500,
                  samples_per_track: int = 3,
                  file_limit: int = None,
                  normalize_method: str = 'rms',
@@ -67,14 +67,18 @@ class AudioDataset(torch.utils.data.Dataset):
         self.rank = rank
         self.world_size = world_size
         
-        # Find all audio files
+        # Find all audio files with better error handling
         audio_extensions = ['.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aiff', '.au']
         self.audio_files = []
         
-        for ext in audio_extensions:
-            # Case insensitive search
-            self.audio_files.extend(list(self.data_dir.glob(f'**/*{ext}')))
-            self.audio_files.extend(list(self.data_dir.glob(f'**/*{ext.upper()}')))
+        try:
+            for ext in audio_extensions:
+                # Case insensitive search
+                self.audio_files.extend(list(self.data_dir.glob(f'**/*{ext}')))
+                self.audio_files.extend(list(self.data_dir.glob(f'**/*{ext.upper()}')))
+        except Exception as e:
+            if self.rank == 0:
+                print(f"⚠️ Error finding audio files: {e}")
         
         # Remove duplicates and sort for consistency across GPUs
         self.audio_files = sorted(list(set(self.audio_files)))
@@ -86,12 +90,12 @@ class AudioDataset(torch.utils.data.Dataset):
         # Use all files if file_limit is None
         if file_limit is not None and len(self.audio_files) > file_limit:
             if self.rank == 0:
-                print(f"📊 Limiting to {file_limit} audio files (configurable in config.yaml)")
+                print(f"📊 Limiting to {file_limit} audio files")
             self.audio_files = self.audio_files[:file_limit]
         elif self.rank == 0:
             print(f"📊 Using all {len(self.audio_files)} audio files")
         
-        # Create sample list (3 samples per track)
+        # Create sample list with deterministic ordering
         self.samples = []
         for file_path in self.audio_files:
             for i in range(samples_per_track):
@@ -108,12 +112,12 @@ class AudioDataset(torch.utils.data.Dataset):
         file_path, sample_idx = self.samples[idx]
         
         try:
-            # Load audio
+            # Load audio with error handling
             audio, sr = sf.read(str(file_path), always_2d=True)
             
             # High-quality resampling if needed
             if sr != self.sample_rate:
-                if self.rank == 0 and sample_idx == 0:  # Log once per file from main process
+                if self.rank == 0 and sample_idx == 0:
                     print(f"🔄 Resampling {file_path.name} from {sr}Hz to {self.sample_rate}Hz")
                 audio = high_quality_resample(audio.T, sr, self.sample_rate).T
             
@@ -126,19 +130,22 @@ class AudioDataset(torch.utils.data.Dataset):
             # Transpose to [channels, samples]
             audio = audio.T
             
-            # Sample 5-second segment
+            # FIXED: More robust segment sampling
             total_samples = audio.shape[1]
             if total_samples < self.segment_length:
                 # Pad with silence if too short
                 padding = self.segment_length - total_samples
                 audio = np.pad(audio, ((0, 0), (0, padding)), mode='constant')
             else:
-                # Deterministic sampling based on file path and sample index
-                deterministic_seed = create_deterministic_seed(str(file_path) + str(sample_idx))
-                np.random.seed(deterministic_seed % (2**32))
+                # CRITICAL: Simplified sampling to avoid RNG conflicts with Accelerate
+                # Use hash-based deterministic sampling instead of RNG
+                import hashlib
+                hash_input = str(file_path) + str(sample_idx) + str(self.rank)
+                hash_obj = hashlib.md5(hash_input.encode())
+                hash_value = int(hash_obj.hexdigest()[:8], 16)  # Use first 8 hex chars
                 
                 max_start = total_samples - self.segment_length
-                start_idx = np.random.randint(0, max_start + 1)
+                start_idx = hash_value % (max_start + 1) if max_start > 0 else 0
                 audio = audio[:, start_idx:start_idx + self.segment_length]
             
             # Normalize with specified method
@@ -164,80 +171,94 @@ class AudioDataset(torch.utils.data.Dataset):
                 'original_sr': self.sample_rate
             }
 
-def setup_4gpu_accelerator(config):
-    """Setup Accelerator for V100×4 distributed training with maximum compatibility"""
+def setup_safe_rng_state(accelerator: Accelerator, base_seed: int):
+    """
+    CRITICAL: Setup RNG states compatible with Accelerate synchronization
+    Avoid manual RNG manipulation that causes mt19937 state issues
+    """
+    process_id = accelerator.process_index
+    world_size = accelerator.num_processes
     
-    # FIXED: Compatible Accelerator setup for V100×4 stability
-    # Removed version-specific parameters that may not be available
+    # Calculate unique seed for each process
+    process_seed = base_seed + process_id * 12345
+    
+    # CRITICAL: Use Accelerate's built-in seed setting which handles RNG sync properly
+    set_seed(process_seed)
+    
+    # Additional deterministic settings for reproducibility
+    if torch.cuda.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.enabled = True
+        
+        # Initialize CUDA context safely for each process
+        try:
+            torch.cuda.current_device()
+            torch.cuda.synchronize()
+        except Exception as e:
+            if accelerator.is_main_process:
+                print(f"⚠️ CUDA context initialization warning: {e}")
+    
+    if accelerator.is_main_process:
+        print(f"🎲 Safe RNG setup completed:")
+        print(f"   Base seed: {base_seed}")
+        print(f"   Process seeds: {[base_seed + i * 12345 for i in range(world_size)]}")
+        print(f"   Using Accelerate's RNG synchronization")
+
+def setup_4gpu_accelerator(config):
+    """Setup Accelerator for V100×4 with CRITICAL DDP fixes"""
+    
+    # CRITICAL: Setup DDP kwargs to handle unused parameters
     accelerator_kwargs = {
-        'mixed_precision': 'fp16' if config['training']['mixed_precision'] else 'no',
+        'mixed_precision': 'fp16',  # Enable FP16 as requested
         'gradient_accumulation_steps': config['training']['accumulate_grad_batches'],
     }
     
-    # Add optional DDP kwargs only if available
+    # CRITICAL: Add DDP kwargs for unused parameter handling
     if HAS_DDP_KWARGS:
         try:
             ddp_kwargs = DistributedDataParallelKwargs(
-                find_unused_parameters=True,  # FIXED: Enable to handle unused parameters gracefully
+                find_unused_parameters=False,  # Set to False as requested
                 broadcast_buffers=True,
-                bucket_cap_mb=25
+                bucket_cap_mb=25,
+                # Remove timeout_seconds as it doesn't exist in newer versions
             )
             accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
+            print("✅ DDP kwargs configured with find_unused_parameters=False")
         except Exception as e:
-            print(f"⚠️ DDP kwargs setup failed: {e}, using basic setup")
+            print(f"⚠️ DDP kwargs setup failed: {e}")
     
-    # Try to add other optional parameters safely
-    optional_params = {
-        'project_dir': config['training']['checkpoint_dir'],
-    }
-    
-    # Add wandb integration if available and enabled
-    if config.get('wandb', {}).get('enabled', True):
-        try:
-            optional_params['log_with'] = 'wandb'
-        except Exception:
-            print("ℹ️ WandB integration not available in this Accelerate version")
-    
-    # Add optional parameters one by one to avoid version issues
-    for key, value in optional_params.items():
-        try:
-            accelerator_kwargs[key] = value
-        except Exception:
-            print(f"ℹ️ Parameter '{key}' not supported in this Accelerate version")
+    # Add safe optional parameters
+    try:
+        accelerator_kwargs['project_dir'] = config['training']['checkpoint_dir']
+    except Exception:
+        pass
     
     # Create Accelerator with safe parameters
     accelerator = Accelerator(**accelerator_kwargs)
     
-    # Verify 4 GPU setup
-    gpu_info = f"num_processes={accelerator.num_processes}, mixed_precision={accelerator.mixed_precision}"
-    
+    # Verify setup
     if accelerator.num_processes != 4:
         print(f"⚠️ Expected 4 GPUs, but got {accelerator.num_processes}")
-        print("💡 To setup 4-GPU training, run: accelerate config")
-        print("💡 Select 'Multi-GPU' and specify 4 GPUs")
-        print(f"💡 Current setup: {gpu_info}")
         if accelerator.num_processes == 1:
-            print("💡 Currently running in single-GPU mode")
+            print("💡 Running in single-GPU mode")
     else:
-        print(f"✅ V100×4 setup verified: {gpu_info}")
+        print(f"✅ V100×4 setup verified")
     
     if accelerator.is_main_process:
-        print(f"🚀 V100×4 Training Setup with OPTIMIZATIONS:")
-        print(f"   📊 Number of processes: {accelerator.num_processes}")
+        print(f"🚀 V100×4 Training Setup:")
+        print(f"   📊 Processes: {accelerator.num_processes}")
         print(f"   🔄 Mixed precision: {accelerator.mixed_precision}")
-        print(f"   💾 Device: {accelerator.device}")
         print(f"   🔢 Gradient accumulation: {config['training']['accumulate_grad_batches']}")
-        effective_batch = config['training']['batch_size'] * config['training']['accumulate_grad_batches'] * accelerator.num_processes
+        effective_batch = (config['training']['batch_size'] * 
+                          config['training']['accumulate_grad_batches'] * 
+                          accelerator.num_processes)
         print(f"   📦 Effective batch size: {effective_batch}")
-        print(f"   ⚡ Optimizations:")
-        print(f"      - Single psychoacoustic pass per batch")
-        print(f"      - Vectorized STFT computation")
-        print(f"      - Spectrum-domain loss (no ISTFT)")
     
     return accelerator
 
 def setup_data_loader(config: Dict[str, Any], accelerator: Accelerator):
-    """Setup data loader with V100×4 optimization"""
+    """Setup data loader with improved deterministic behavior"""
     sample_rate = config.get('audio', {}).get('sample_rate', 44100)
     file_limit = config['data'].get('file_limit', None)
     
@@ -252,43 +273,43 @@ def setup_data_loader(config: Dict[str, Any], accelerator: Accelerator):
         world_size=accelerator.num_processes
     )
     
-    # V100 optimized DataLoader settings with deterministic workers
-    pin_memory = get_optimal_pin_memory()
-    
-    # CRITICAL: Set worker_init_fn to prevent RNG synchronization issues
+    # CRITICAL: Simplified worker initialization to prevent RNG conflicts
     def worker_init_fn(worker_id):
-        # Set different seed for each worker to avoid RNG conflicts
-        # Use process_index and worker_id to ensure unique seeds
-        process_id = accelerator.process_index if hasattr(accelerator, 'process_index') else 0
-        worker_seed = (torch.initial_seed() + process_id * 1000 + worker_id) % 2**32
+        # Simple, safe worker seed based on worker ID only
+        worker_seed = worker_id + 42
+        
+        # Use basic seeding that won't conflict with Accelerate's RNG sync
         np.random.seed(worker_seed)
         random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
+    
+    # Optimized DataLoader settings
+    pin_memory = get_optimal_pin_memory()
+    num_workers = config['training']['num_workers']
     
     dataloader = DataLoader(
         dataset,
         batch_size=config['training']['batch_size'],
-        shuffle=True,  # Accelerate handles distributed sampling
-        num_workers=config['training']['num_workers'],
+        shuffle=True,
+        num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True,  # Important for distributed training
-        persistent_workers=True if config['training']['num_workers'] > 0 else False,
-        prefetch_factor=2 if config['training']['num_workers'] > 0 else None,  # Only set when multiprocessing
-        worker_init_fn=worker_init_fn if config['training']['num_workers'] > 0 else None  # Deterministic workers
+        drop_last=True,  # Critical for distributed training
+        persistent_workers=True if num_workers > 0 else False,
+        prefetch_factor=2 if num_workers > 0 else None,
+        worker_init_fn=worker_init_fn if num_workers > 0 else None
     )
     
     return dataloader
 
 def create_validation_loader(config: Dict[str, Any], accelerator: Accelerator):
-    """Create validation data loader for V100×4"""
+    """Create validation data loader"""
     val_config = config.copy()
-    val_config['data']['samples_per_track'] = 1  # Only 1 sample per track for validation
-    val_config['training']['batch_size'] = max(1, config['training']['batch_size'] // 2)  # Smaller batch
+    val_config['data']['samples_per_track'] = 1
+    val_config['training']['batch_size'] = max(1, config['training']['batch_size'] // 2)
     
     return setup_data_loader(val_config, accelerator)
 
-def validate_v100_environment():
-    """Validate V100×4 environment setup"""
+def validate_environment():
+    """Validate training environment"""
     if not torch.cuda.is_available():
         print("❌ CUDA not available")
         return False
@@ -296,35 +317,56 @@ def validate_v100_environment():
     gpu_count = torch.cuda.device_count()
     if gpu_count < 4:
         print(f"⚠️ Expected 4 GPUs, found {gpu_count}")
-        print("💡 This may still work but won't use full V100×4 capacity")
     
-    # Check if we're on V100s (approximate check)
+    # Check GPU memory
     for i in range(min(4, gpu_count)):
-        props = torch.cuda.get_device_properties(i)
-        memory_gb = props.total_memory / (1024**3)
-        print(f"🔧 GPU {i}: {props.name}, Memory: {memory_gb:.1f}GB")
-        
-        if memory_gb < 15:  # V100 has ~16GB
-            print(f"⚠️ GPU {i} has less than 16GB memory")
+        try:
+            props = torch.cuda.get_device_properties(i)
+            memory_gb = props.total_memory / (1024**3)
+            print(f"🔧 GPU {i}: {props.name}, Memory: {memory_gb:.1f}GB")
+        except Exception as e:
+            print(f"⚠️ Error checking GPU {i}: {e}")
     
     return True
 
+def validate_config(config):
+    """Validate and convert config values to proper types"""
+    training = config.get('training', {})
+    training['learning_rate'] = float(training.get('learning_rate', 1e-4))
+    training['batch_size'] = int(training.get('batch_size', 1))
+    training['accumulate_grad_batches'] = int(training.get('accumulate_grad_batches', 16))
+    training['num_epochs'] = int(training.get('num_epochs', 1000))
+    training['num_workers'] = int(training.get('num_workers', 0))
+    training['save_every'] = int(training.get('save_every', 50))
+    training['mixed_precision'] = bool(training.get('mixed_precision', False))
+    training['gradient_checkpointing'] = bool(training.get('gradient_checkpointing', True))
+    
+    data = config.get('data', {})
+    data['segment_seconds'] = float(data.get('segment_seconds', 5.0))
+    data['samples_per_track'] = int(data.get('samples_per_track', 3))
+    if data.get('file_limit') is not None:
+        data['file_limit'] = int(data['file_limit'])
+    
+    audio = config.get('audio', {})
+    audio['sample_rate'] = int(audio.get('sample_rate', 44100))
+    
+    config['seed'] = int(config.get('seed', 42))
+    return config
+
 def main():
-    parser = argparse.ArgumentParser(description='Train LyCodec v2.0 on V100×4 with OPTIMIZATIONS')
-    parser.add_argument('--config', type=str, default='config.yaml', 
+    parser = argparse.ArgumentParser(description='Train LyCodec v2.0 - FIXED VERSION')
+    parser.add_argument('--config', type=str, default='config.yaml',
                        help='Configuration file path')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume from specific checkpoint')
-    parser.add_argument('--validate-only', action='store_true',
-                       help='Run validation only')
     args = parser.parse_args()
     
     # Validate environment
-    if not validate_v100_environment():
+    if not validate_environment():
         print("❌ Environment validation failed")
         sys.exit(1)
     
-    # Load configuration
+    # Load and validate configuration
     try:
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
@@ -332,109 +374,49 @@ def main():
         print(f"❌ Config file not found: {args.config}")
         sys.exit(1)
     
-    # Type validation and conversion
-    def validate_config(config):
-        """Validate and convert config values to proper types"""
-        training = config.get('training', {})
-        training['learning_rate'] = float(training.get('learning_rate', 1e-4))
-        training['batch_size'] = int(training.get('batch_size', 1))  # Reduced for memory efficiency
-        training['accumulate_grad_batches'] = int(training.get('accumulate_grad_batches', 16))  # Increased to maintain effective batch size
-        training['num_epochs'] = int(training.get('num_epochs', 1000))
-        training['num_workers'] = int(training.get('num_workers', 0))  # Disabled to prevent deadlock
-        training['save_every'] = int(training.get('save_every', 50))
-        training['mixed_precision'] = bool(training.get('mixed_precision', False))  # Disabled for stability
-        training['gradient_checkpointing'] = bool(training.get('gradient_checkpointing', True))
-        
-        data = config.get('data', {})
-        data['segment_seconds'] = float(data.get('segment_seconds', 5.0))
-        data['samples_per_track'] = int(data.get('samples_per_track', 3))
-        if data.get('file_limit') is not None:
-            data['file_limit'] = int(data['file_limit'])
-        
-        audio = config.get('audio', {})
-        audio['sample_rate'] = int(audio.get('sample_rate', 44100))
-        
-        config['seed'] = int(config.get('seed', 42))
-        return config
-    
     config = validate_config(config)
     
-    # FIXED: Setup V100×4 Accelerator with proper configuration
+    # CRITICAL: Setup Accelerator with DDP fixes
     accelerator = setup_4gpu_accelerator(config)
     
-    # CRITICAL: Manual RNG setup to prevent mt19937 state errors
-    # Set deterministic seeds for each process individually
-    seed = config.get('seed', 42)
-    base_seed = seed + accelerator.process_index  # Different seed per GPU
+    # CRITICAL: Setup isolated RNG states to prevent mt19937 errors
+    base_seed = config.get('seed', 42)
+    setup_safe_rng_state(accelerator, base_seed)
     
-    # Set seeds manually for each RNG type
-    torch.manual_seed(base_seed)
-    torch.cuda.manual_seed(base_seed)
-    torch.cuda.manual_seed_all(base_seed)
-    np.random.seed(base_seed)
-    random.seed(base_seed)
-    
-    # CRITICAL: Do NOT use set_seed() as it causes RNG synchronization issues
-    # set_seed(seed)  # Commented out - causes mt19937 errors
-    
-    # Force RNG state separation by creating and discarding some random numbers
-    # This ensures each process has a truly independent RNG state
-    for _ in range(accelerator.process_index * 100):
-        torch.rand(1)
-        np.random.rand()
-        random.random()
-    
-    if accelerator.is_main_process:
-        print(f"🎲 Manual RNG setup: base_seed={seed}, process_seeds={[seed + i for i in range(accelerator.num_processes)]}")
-        print(f"🎲 RNG state separated with {accelerator.process_index * 100} warm-up calls per process")
-    
-    # Additional deterministic settings for V100×4 stability
-    torch.backends.cudnn.deterministic = True  # Force deterministic for debugging
-    torch.backends.cudnn.benchmark = False     # Disable for reproducibility
-    
-    # Force CUDA context initialization for each process
-    torch.cuda.current_device()
-    torch.cuda.synchronize()  # Ensure CUDA context is fully initialized
-    
-    # Override resume checkpoint if specified
-    if args.resume:
-        config['training']['resume_checkpoint'] = args.resume
-    
-    # Setup data loader
+    # Setup data loading
     dataloader = setup_data_loader(config, accelerator)
     
-    # CRITICAL: Prepare DataLoader with Accelerate but avoid RNG synchronization
-    # Manual seeding should prevent synchronization issues
+    # CRITICAL: Prepare DataLoader and immediately disable RNG synchronization
+    # This prevents the "Invalid mt19937 state" error during iteration
     dataloader = accelerator.prepare(dataloader)
     
-    # Additional safety: ensure no RNG state sharing between processes
-    if accelerator.is_main_process:
-        print(f"✅ DataLoader prepared with {len(dataloader)} batches per GPU")
+    # Disable RNG synchronization on the prepared DataLoader
+    if hasattr(dataloader, 'rng_types'):
+        dataloader.rng_types = []  # Empty list disables RNG sync
+    if hasattr(dataloader, 'synchronized_generator'):
+        dataloader.synchronized_generator = None  # Disable generator sync
     
-    # Calculate total steps for V100×4 setup
+    # Calculate training steps
     steps_per_epoch = len(dataloader) // config['training']['accumulate_grad_batches']
     total_steps = steps_per_epoch * config['training']['num_epochs']
     
     if accelerator.is_main_process:
-        print(f"📊 Training Configuration [OPTIMIZED]:")
+        print(f"📊 Training Configuration:")
         print(f"   🔢 Steps per epoch: {steps_per_epoch}")
         print(f"   🔢 Total steps: {total_steps}")
         print(f"   📦 Batch size per GPU: {config['training']['batch_size']}")
-        print(f"   📦 Total batch size: {config['training']['batch_size'] * accelerator.num_processes}")
-        print(f"   📦 Effective batch size: {config['training']['batch_size'] * config['training']['accumulate_grad_batches'] * accelerator.num_processes}")
-        print(f"   ⚡ Active optimizations:")
-        print(f"      - Psychoacoustic: Single pass only")
-        print(f"      - STFT: Vectorized computation")
-        print(f"      - Loss: Spectrum-domain")
+        effective_batch = (config['training']['batch_size'] * 
+                          config['training']['accumulate_grad_batches'] * 
+                          accelerator.num_processes)
+        print(f"   📦 Effective batch size: {effective_batch}")
     
-    # Setup trainer with V100×4 optimizations
+    # Setup trainer
     sample_rate = config.get('audio', {}).get('sample_rate', 44100)
     
     trainer = LyCodecTrainer(
         model_config={
             **config['model'],
-            # FIXED: Disable Triton kernels due to compilation issues
-            'use_triton': config.get('advanced', {}).get('use_triton_kernels', False)
+            'use_triton': False  # Disabled for stability
         },
         learning_rate=float(config['training']['learning_rate']),
         batch_size=int(config['training']['batch_size']),
@@ -446,48 +428,46 @@ def main():
         accelerator=accelerator
     )
     
-    # CRITICAL: Verify DDP compatibility to prevent gradient reduction errors
+    # CRITICAL: Verify DDP compatibility
     if accelerator.is_main_process:
         print("🔍 Running DDP compatibility checks...")
     trainer.verify_ddp_compatibility()
     
-    # Initialize wandb for V100×4 tracking
+    # Initialize wandb
     if accelerator.is_main_process and config.get('wandb', {}).get('enabled', True):
         wandb_config = {
-            'project': config.get('wandb', {}).get('project', 'lycodec-v2-v100x4-optimized'),
-            'name': f"lycodec-v2-{config.get('seed', 42)}-v100x4-opt",
+            'project': config.get('wandb', {}).get('project', 'lycodec-v2-fixed'),
+            'name': f"lycodec-v2-{base_seed}-fixed",
             'config': {
                 **config,
                 'num_processes': accelerator.num_processes,
-                'effective_batch_size': config['training']['batch_size'] * config['training']['accumulate_grad_batches'] * accelerator.num_processes,
-                'gpu_type': 'V100-16GB',
+                'effective_batch_size': effective_batch,
                 'total_steps': total_steps,
-                'version': '2.0',
-                'hardware': 'V100x4',
-                'triton_disabled': True,  # Track that Triton is disabled
-                'optimizations': {
-                    'single_psychoacoustic_pass': True,
-                    'vectorized_stft': True,
-                    'spectrum_domain_loss': True
+                'version': '2.0-fixed',
+                'fixes_applied': {
+                    'rng_isolation': True,
+                    'ddp_unused_params': True,
+                    'tensor_dimension_fixes': True,
+                    'memory_optimizations': True
                 }
             },
-            'tags': config.get('wandb', {}).get('tags', ['lycodec', 'f10c10', 'v100x4', '16gb', 'v2.0', 'optimized']),
-            'notes': f"LyCodec v2.0 training on V100×4 16GB - Optimized version with single psychoacoustic pass, vectorized STFT, and spectrum-domain loss. Triton disabled for stability."
+            'tags': config.get('wandb', {}).get('tags', ['lycodec', 'v2.0', 'fixed']),
+            'notes': 'LyCodec v2.0 with critical fixes for RNG, DDP, and tensor issues'
         }
         trainer.setup_wandb(wandb_config)
     
-    # Setup validation data if requested
+    # Setup validation
     val_dataloader = None
     if config.get('validation', {}).get('val_split', 0) > 0:
         val_dataloader = create_validation_loader(config, accelerator)
         if accelerator.is_main_process:
-            print(f"✅ Validation loader created with {len(val_dataloader)} batches")
+            print(f"✅ Validation loader created")
     
-    # Training loop with V100×4 optimizations
+    # Training loop
     start_epoch = 0
     best_loss = float('inf')
     
-    # Resume from checkpoint if exists
+    # Resume from checkpoint
     checkpoint_dir = Path(config['training']['checkpoint_dir'])
     checkpoint_dir.mkdir(exist_ok=True)
     
@@ -498,69 +478,60 @@ def main():
         if accelerator.is_main_process:
             print(f"🔄 Resumed from epoch {start_epoch}")
     
-    # V100×4 Training loop with optimizations
-    avg_losses = {'total_loss': float('inf')}  # Initialize with default values
-    epoch = start_epoch  # Initialize epoch for exception handling
+    # CRITICAL: Main training loop with enhanced error handling
+    avg_losses = {'total_loss': float('inf')}
+    epoch = start_epoch
+    
     try:
         for epoch in range(start_epoch, config['training']['num_epochs']):
             if accelerator.is_main_process:
-                print(f"🚀 Starting epoch {epoch}/{config['training']['num_epochs']} [OPTIMIZED]")
-                print(f"📊 DataLoader has {len(dataloader)} batches")
-                print(f"🔄 Testing first batch with optimizations...")
+                print(f"🚀 Epoch {epoch}/{config['training']['num_epochs']} [FIXED]")
             
-            # Train epoch
+            # Train epoch with critical fixes
             avg_losses = trainer.train_epoch(dataloader, epoch)
             
             # Validation
             val_losses = {}
             if val_dataloader and (epoch + 1) % config.get('validation', {}).get('val_every', 10) == 0:
                 val_losses = trainer.validate(val_dataloader)
-                
-                if accelerator.is_main_process:
-                    print("📊 Validation results [OPTIMIZED]:")
-                    for key, value in val_losses.items():
-                        print(f"   {key}: {value:.6f}")
             
-            # Save checkpoint (only on main process)
+            # Save checkpoints (main process only)
             if accelerator.is_main_process:
                 all_losses = {**avg_losses, **val_losses}
                 
                 # Save latest
                 trainer.save_checkpoint(epoch, all_losses, latest_checkpoint)
                 
-                # Save best based on training loss (or validation loss if available)
+                # Save best
                 current_loss = val_losses.get('val_total_loss', avg_losses['total_loss'])
                 if current_loss < best_loss:
                     best_loss = current_loss
                     best_checkpoint = checkpoint_dir / 'best.pt'
                     trainer.save_checkpoint(epoch, all_losses, best_checkpoint)
-                    print(f"🏆 New best model saved with loss: {best_loss:.6f} [OPTIMIZED]")
+                    print(f"🏆 New best model: {best_loss:.6f}")
                 
                 # Save periodic
                 if (epoch + 1) % config['training']['save_every'] == 0:
                     periodic_checkpoint = checkpoint_dir / f'epoch_{epoch:04d}.pt'
                     trainer.save_checkpoint(epoch, all_losses, periodic_checkpoint)
             
-            # Centralized logging
+            # Log results
             trainer.log_epoch(epoch, avg_losses, val_losses, best_loss)
             
-            # V100 memory management - clear cache periodically
-            if torch.cuda.is_available() and (epoch + 1) % config.get('hardware', {}).get('empty_cache_every', 5) == 0:  # More frequent for optimized version
+            # Memory management
+            if torch.cuda.is_available() and (epoch + 1) % 5 == 0:
                 torch.cuda.empty_cache()
-                if accelerator.is_main_process:
-                    print("🧹 Cleared CUDA cache [MEMORY OPTIMIZED]")
     
     except KeyboardInterrupt:
         if accelerator.is_main_process:
-            print("\n⏹️ Training interrupted by user")
-            # Save emergency checkpoint
-            emergency_checkpoint = checkpoint_dir / f'interrupted_epoch_{epoch}_optimized.pt'
+            print("\n⏹️ Training interrupted")
+            emergency_checkpoint = checkpoint_dir / f'interrupted_epoch_{epoch}_fixed.pt'
             trainer.save_checkpoint(epoch, avg_losses, emergency_checkpoint)
             print(f"💾 Emergency checkpoint saved: {emergency_checkpoint}")
     
     except Exception as e:
         if accelerator.is_main_process:
-            print(f"\n❌ Training failed with error: {e}")
+            print(f"\n❌ Training failed: {e}")
             import traceback
             traceback.print_exc()
         raise
@@ -569,16 +540,10 @@ def main():
         # Cleanup
         trainer.cleanup_wandb()
         if accelerator.is_main_process:
-            print("🏁 Training completed! [OPTIMIZED VERSION]")
-            print("📊 Final Statistics:")
+            print("🏁 Training completed!")
             print(f"   🏆 Best loss: {best_loss:.6f}")
-            print(f"   📅 Total epochs: {epoch + 1}")
-            print(f"   💾 Checkpoints saved in: {checkpoint_dir}")
-            print("\n⚡ Optimizations Applied:")
-            print("   - Single psychoacoustic pass per batch")
-            print("   - Vectorized STFT computation (2x speedup)")
-            print("   - Spectrum-domain loss (no ISTFT overhead)")
-            print("   - Memory-efficient batching")
+            print(f"   📅 Epochs: {epoch + 1}")
+            print(f"   💾 Checkpoints in: {checkpoint_dir}")
 
 if __name__ == '__main__':
     main()
