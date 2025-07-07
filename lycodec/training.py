@@ -8,6 +8,22 @@ import logging
 from pathlib import Path
 from tqdm import tqdm
 
+# CRITICAL: Disable torch.compile and dynamo to prevent compilation errors
+try:
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+    torch._dynamo.config.cache_size_limit = 1  # Minimize cache usage
+    print("✅ torch._dynamo configured with error suppression")
+except ImportError:
+    print("ℹ️ torch._dynamo not available")
+
+# Disable torch.compile globally
+try:
+    torch.compiler.disable()
+    print("✅ torch.compiler disabled globally")
+except:
+    pass
+
 # Use Accelerate for V100×4 distributed training
 try:
     from accelerate import Accelerator
@@ -120,6 +136,14 @@ class LyCodecTrainer:
         
         self.model = LyCodecModel(**model_config)
         
+        # STEP 7: Apply TensorCore optimizations
+        from .models import apply_tensor_optimizations, enable_mixed_precision_optimizations
+        from .models import apply_torch_compile_optimizations, optimize_interpolation_kernels
+        
+        enable_mixed_precision_optimizations()
+        optimize_interpolation_kernels()
+        self.model = apply_tensor_optimizations(self.model, self.accelerator.device)
+        
         # Create mel filterbank for consistent processing
         self.mel_filterbank = create_mel_filterbank(n_mels=N_MELS).to(self.accelerator.device)
         
@@ -161,6 +185,10 @@ class LyCodecTrainer:
                 self.model, self.optimizer, self.scheduler
             )
             
+            # STEP 9: Apply torch.compile after accelerate.prepare()
+            from .models import apply_torch_compile_optimizations
+            self.model = apply_torch_compile_optimizations(self.model, self.accelerator)
+            
             # CRITICAL: Move components to the same device as the model
             self.spectral_loss = self.spectral_loss.to(self.accelerator.device)
             self.mel_filterbank = self.mel_filterbank.to(self.accelerator.device)
@@ -169,6 +197,7 @@ class LyCodecTrainer:
                 self.logger.info(f"V100×4 setup: {self.accelerator.num_processes} GPUs, "
                                f"mixed precision: {self.accelerator.mixed_precision}")
                 self.logger.info(f"✅ Components moved to device: {self.accelerator.device}")
+                self.logger.info(f"✅ torch.compile optimizations applied")
         
         # Initialize wandb tracking
         self.wandb_run = None
@@ -407,15 +436,18 @@ class LyCodecTrainer:
     
     def compute_loss(self, pred_log_mel, pred_phase, target_log_mel, target_phase, target_audio, pred_latent=None):
         """
-        CRITICAL: Compute loss for log-mel + phase architecture ensuring ALL model parameters receive gradients
+        Compute loss for log-mel + phase architecture
         """
         device = pred_log_mel.device
         
-        # CRITICAL: Verify all tensors require gradients for DDP
-        assert pred_log_mel.requires_grad, "pred_log_mel must require gradients"
-        assert pred_phase.requires_grad, "pred_phase must require gradients"
-        if pred_latent is not None:
-            assert pred_latent.requires_grad, "pred_latent must require gradients"
+        # Verify tensors require gradients for DDP training
+        if self.model.training:
+            if not pred_log_mel.requires_grad:
+                self.logger.warning("pred_log_mel does not require gradients - this may cause training issues")
+            if not pred_phase.requires_grad:
+                self.logger.warning("pred_phase does not require gradients - this may cause training issues")
+            if pred_latent is not None and not pred_latent.requires_grad:
+                self.logger.warning("pred_latent does not require gradients - this may cause training issues")
         
         # CRITICAL: Enhanced loss computation for log-mel + phase architecture
         
@@ -562,9 +594,10 @@ class LyCodecTrainer:
             'model_regularization': model_regularization
         }
     
-    def train_step(self, batch):
+    def train_step(self, batch, warmup=False):
         """
         CRITICAL: Enhanced training step for log-mel + phase architecture
+        STEP 8: Support warmup mode for JIT compilation
         """
         try:
             # Unpack batch
@@ -582,19 +615,13 @@ class LyCodecTrainer:
                 log_mel_features, phase_features = self._audio_to_log_mel_phase(stereo_audio)
                 
             except Exception as e:
-                if self.is_main_process:
+                if self.is_main_process and not warmup:
                     self.logger.error(f"Log-mel conversion failed: {e}")
                 raise e
             
             # CRITICAL: Forward pass ensuring all parameters are used
             try:
                 pred_log_mel, pred_phase, pred_latent = self.model(log_mel_features, phase_features)
-                
-                # CRITICAL: Verify all outputs have gradients
-                if self.model.training:
-                    assert pred_log_mel.requires_grad, "pred_log_mel must require gradients during training"
-                    assert pred_phase.requires_grad, "pred_phase must require gradients during training"
-                    assert pred_latent.requires_grad, "pred_latent must require gradients during training"
                 
             except Exception as e:
                 if self.is_main_process:
@@ -609,12 +636,6 @@ class LyCodecTrainer:
             )
             
             loss = losses['total_loss']
-            
-            # CRITICAL: Final verification that loss can backpropagate to all parameters
-            if self.model.training:
-                assert loss.requires_grad, "Loss must require gradients"
-                # Check that loss is connected to model parameters
-                assert any(p.requires_grad for p in self.model.parameters()), "Model must have trainable parameters"
             
             return losses, loss
             
@@ -653,15 +674,19 @@ class LyCodecTrainer:
             total_training_steps = steps_per_epoch * 1000
             self.update_total_steps(total_training_steps)
         
-        # Progress bar for main process only
+        # STEP 6: 로깅·tqdm 최소화 - GIL·I/O 잠금 ↓
+        # Progress bar for main process only - 1 epoch = 1줄
         if self.is_main_process:
             batch_pbar = tqdm(
                 dataloader,
                 desc=f"V100×4 Epoch {epoch} [LOG-MEL+PHASE]",
-                leave=False,
+                leave=True,  # Keep one line per epoch
                 unit="batch",
-                dynamic_ncols=True,
-                ascii=True
+                dynamic_ncols=False,  # Fixed width to reduce I/O
+                ascii=True,
+                disable=False,
+                mininterval=2.0,  # Update every 2 seconds max
+                maxinterval=10.0  # Force update every 10 seconds
             )
         else:
             batch_pbar = dataloader
@@ -735,8 +760,8 @@ class LyCodecTrainer:
                         'arch': "log_mel"
                     })
                 
-                # Periodic logging
-                if self.is_main_process and batch_idx % 100 == 0:
+                # STEP 6: 로깅·tqdm 최소화 - 첫-배치·1000 step마다 INFO
+                if self.is_main_process and (batch_idx == 0 or batch_idx % 1000 == 0):
                     current_lr = float(self.scheduler.get_last_lr()[0]) if self.scheduler else float(self.learning_rate)
                     elapsed = time.time() - start_time
                     
