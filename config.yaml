@@ -20,17 +20,17 @@ model:
 # Training configuration
 training:
   # Batch and memory settings (optimized for 16GB VRAM)
-  batch_size: 4                           # Per-GPU batch size
-  accumulate_grad_batches: 4              # Gradient accumulation (effective batch: 16)
-  num_workers: 4                          # Data loading workers per GPU
+  batch_size: 1                           # Reduced batch size to prevent OOM
+  accumulate_grad_batches: 16             # Increased accumulation to maintain effective batch size
+  num_workers: 0                          # Disable multiprocessing to test for deadlock
   
   # Optimization
   learning_rate: 0.0001                    # Peak learning rate (1e-4)
   num_epochs: 1000                        # Total training epochs
   
   # Memory optimization
-  mixed_precision: true                   # Use AMP for memory efficiency (handled by Accelerate)
-  gradient_checkpointing: true            # Enable gradient checkpointing
+  mixed_precision: false                  # Disable AMP to test for stability issues
+  gradient_checkpointing: true            # Enable gradient checkpointing to save memory
   
   # Checkpointing
   checkpoint_dir: "checkpoints"           # Directory to save checkpoints
@@ -40,7 +40,7 @@ training:
 accelerate:
   # These settings are managed by Accelerate's config system
   # Run 'accelerate config' to set up distributed training
-  mixed_precision: "fp16"                 # Options: "no", "fp16", "bf16"
+  mixed_precision: "no"                   # Disable mixed precision to test stability
   gradient_accumulation_steps: 4          # Should match training.accumulate_grad_batches
   num_processes: 4                        # Number of GPUs to use
 
@@ -96,9 +96,9 @@ hardware:
   use_tensor_cores: true                  # Enable Tensor Core usage for mixed precision
   cudnn_benchmark: false                  # Disable for reproducibility, enable for speed after debugging
   
-  # Memory management for 16GB cards
-  empty_cache_every: 10                   # Clear CUDA cache every N batches (more frequent)
-  max_memory_fraction: 0.90               # Conservative for multi-process training
+  # Memory management for 16GB cards (more aggressive)
+  empty_cache_every: 5                    # Clear CUDA cache every N batches (more frequent)
+  max_memory_fraction: 0.85               # More conservative for multi-process training
   
   # V100 optimization flags
   torch_compile: false                    # PyTorch 2.0 compile (experimental)
