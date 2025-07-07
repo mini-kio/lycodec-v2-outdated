@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """
-LyCodec Training Script v2.0 - V100×4 ACCELERATE VERSION with CRITICAL FIXES
-Fixed RNG synchronization and DDP parameter issues
+LyCodec Training Script v2.0 - LOG-MEL + PHASE ARCHITECTURE with CRITICAL FIXES
+V100×4 ACCELERATE VERSION with comprehensive DDP compatibility
+
+NEW ARCHITECTURE:
+- Waveform → STFT → Magnitude/Phase → Mel filterbank → log_mel (128 bin) + phase preservation
+- PsychoacousticTransform applies masking curve weighting in log-mel domain
+- f10c10 compression (100x) maintained through encoder/decoder stages
 
 CRITICAL FIXES:
 - RNG state isolation to prevent mt19937 errors
-- DDP compatibility improvements with find_unused_parameters
-- Enhanced parameter gradient flow verification
-- Memory and tensor dimension fixes
+- DDP compatibility improvements with find_unused_parameters=False
+- Enhanced parameter gradient flow verification for log-mel architecture
+- Memory and tensor dimension fixes for mel-scale processing
+- Psychoacoustic masking curve continuity in distributed training
 """
 
 import os
@@ -43,11 +49,20 @@ except ImportError:
     sys.exit(1)
 
 from lycodec.training import LyCodecTrainer
-from lycodec.audio import normalize_audio, high_quality_resample, create_deterministic_seed, get_optimal_pin_memory
+from lycodec.audio import (
+    normalize_audio, 
+    high_quality_resample, 
+    create_deterministic_seed, 
+    get_optimal_pin_memory,
+    N_MELS,
+    SAMPLE_RATE,
+    HOP_LENGTH
+)
 
 class AudioDataset(torch.utils.data.Dataset):
     """
-    Dataset for audio files - IMPROVED with better error handling and deterministic sampling
+    Dataset for audio files - ENHANCED for log-mel + phase architecture
+    Optimized for mel-scale processing with better error handling and deterministic sampling
     """
     def __init__(self, 
                  data_dir: str,
@@ -66,6 +81,9 @@ class AudioDataset(torch.utils.data.Dataset):
         self.sample_rate = sample_rate
         self.rank = rank
         self.world_size = world_size
+        
+        # Calculate expected mel time frames for validation
+        self.expected_mel_frames = (segment_length // HOP_LENGTH) + 1
         
         # Find all audio files with better error handling
         audio_extensions = ['.mp3', '.wav', '.flac', '.m4a', '.ogg', '.aiff', '.au']
@@ -86,14 +104,15 @@ class AudioDataset(torch.utils.data.Dataset):
         # Only log from main process
         if self.rank == 0:
             print(f"📁 Found {len(self.audio_files)} audio files")
+            print(f"🎵 Expected mel frames per segment: {self.expected_mel_frames}")
         
         # Use all files if file_limit is None
         if file_limit is not None and len(self.audio_files) > file_limit:
             if self.rank == 0:
-                print(f"📊 Limiting to {file_limit} audio files")
+                print(f"📊 Limiting to {file_limit} audio files for log-mel training")
             self.audio_files = self.audio_files[:file_limit]
         elif self.rank == 0:
-            print(f"📊 Using all {len(self.audio_files)} audio files")
+            print(f"📊 Using all {len(self.audio_files)} audio files for log-mel training")
         
         # Create sample list with deterministic ordering
         self.samples = []
@@ -104,9 +123,41 @@ class AudioDataset(torch.utils.data.Dataset):
         if self.rank == 0:
             print(f"🎵 Total samples: {len(self.samples)} (distributed across {self.world_size} GPUs)")
             print(f"📊 Samples per GPU: ~{len(self.samples) // self.world_size}")
+            print(f"🏗️ Architecture: Log-mel + phase with {N_MELS} mel bins")
     
     def __len__(self):
         return len(self.samples)
+    
+    def _validate_audio_for_mel_processing(self, audio, file_path):
+        """
+        NEW: Validate audio is suitable for mel-scale processing
+        """
+        try:
+            # Check for common audio issues that affect mel processing
+            if np.any(np.isnan(audio)) or np.any(np.isinf(audio)):
+                if self.rank == 0:
+                    print(f"⚠️ Audio contains NaN/Inf values: {file_path.name}")
+                return False
+            
+            # Check dynamic range
+            if np.max(np.abs(audio)) < 1e-6:
+                if self.rank == 0:
+                    print(f"⚠️ Audio too quiet for mel processing: {file_path.name}")
+                return False
+            
+            # Check for extreme values that could affect STFT
+            if np.max(np.abs(audio)) > 10.0:
+                if self.rank == 0:
+                    print(f"⚠️ Audio has extreme values: {file_path.name}")
+                # Clip instead of rejecting
+                audio = np.clip(audio, -1.0, 1.0)
+            
+            return True
+            
+        except Exception as e:
+            if self.rank == 0:
+                print(f"⚠️ Audio validation failed for {file_path.name}: {e}")
+            return False
     
     def __getitem__(self, idx):
         file_path, sample_idx = self.samples[idx]
@@ -118,7 +169,7 @@ class AudioDataset(torch.utils.data.Dataset):
             # High-quality resampling if needed
             if sr != self.sample_rate:
                 if self.rank == 0 and sample_idx == 0:
-                    print(f"🔄 Resampling {file_path.name} from {sr}Hz to {self.sample_rate}Hz")
+                    print(f"🔄 Resampling {file_path.name} from {sr}Hz to {self.sample_rate}Hz for mel processing")
                 audio = high_quality_resample(audio.T, sr, self.sample_rate).T
             
             # Convert to stereo if mono
@@ -130,7 +181,20 @@ class AudioDataset(torch.utils.data.Dataset):
             # Transpose to [channels, samples]
             audio = audio.T
             
-            # FIXED: More robust segment sampling
+            # NEW: Validate audio for mel-scale processing
+            if not self._validate_audio_for_mel_processing(audio, file_path):
+                # Return silence if validation fails
+                audio = np.zeros((2, self.segment_length), dtype=np.float32)
+                return {
+                    'audio': torch.from_numpy(audio),
+                    'filename': f'validation_failed_{file_path.name}',
+                    'sample_idx': sample_idx,
+                    'original_sr': sr,
+                    'mel_frames': self.expected_mel_frames,
+                    'architecture': 'log_mel_phase'
+                }
+            
+            # FIXED: More robust segment sampling optimized for mel processing
             total_samples = audio.shape[1]
             if total_samples < self.segment_length:
                 # Pad with silence if too short
@@ -152,28 +216,35 @@ class AudioDataset(torch.utils.data.Dataset):
             audio_tensor = torch.from_numpy(audio).float()
             audio_tensor = normalize_audio(audio_tensor, method=self.normalize_method)
             
+            # Calculate actual mel frames that will be produced
+            actual_mel_frames = (audio_tensor.shape[-1] // HOP_LENGTH) + 1
+            
             return {
                 'audio': audio_tensor,
                 'filename': str(file_path.name),
                 'sample_idx': sample_idx,
-                'original_sr': sr
+                'original_sr': sr,
+                'mel_frames': actual_mel_frames,
+                'architecture': 'log_mel_phase'
             }
             
         except Exception as e:
             if self.rank == 0:
-                print(f"⚠️ Error loading {file_path}: {e}")
+                print(f"⚠️ Error loading {file_path} for log-mel processing: {e}")
             # Return silence as fallback
             audio = np.zeros((2, self.segment_length), dtype=np.float32)
             return {
                 'audio': torch.from_numpy(audio),
-                'filename': 'error',
+                'filename': f'error_{file_path.name if file_path else "unknown"}',
                 'sample_idx': 0,
-                'original_sr': self.sample_rate
+                'original_sr': self.sample_rate,
+                'mel_frames': self.expected_mel_frames,
+                'architecture': 'log_mel_phase'
             }
 
 def setup_safe_rng_state(accelerator: Accelerator, base_seed: int):
     """
-    CRITICAL: Setup RNG states compatible with Accelerate synchronization
+    CRITICAL: Setup RNG states compatible with Accelerate synchronization for log-mel training
     Avoid manual RNG manipulation that causes mt19937 state issues
     """
     process_id = accelerator.process_index
@@ -200,15 +271,16 @@ def setup_safe_rng_state(accelerator: Accelerator, base_seed: int):
                 print(f"⚠️ CUDA context initialization warning: {e}")
     
     if accelerator.is_main_process:
-        print(f"🎲 Safe RNG setup completed:")
+        print(f"🎲 Safe RNG setup completed for log-mel training:")
         print(f"   Base seed: {base_seed}")
         print(f"   Process seeds: {[base_seed + i * 12345 for i in range(world_size)]}")
         print(f"   Using Accelerate's RNG synchronization")
+        print(f"   Architecture: Log-mel + phase with {N_MELS} mel bins")
 
 def setup_4gpu_accelerator(config):
-    """Setup Accelerator for V100×4 with CRITICAL DDP fixes"""
+    """Setup Accelerator for V100×4 with CRITICAL DDP fixes for log-mel architecture"""
     
-    # CRITICAL: Setup DDP kwargs to handle unused parameters
+    # CRITICAL: Setup DDP kwargs to handle unused parameters for log-mel processing
     accelerator_kwargs = {
         'mixed_precision': 'fp16',  # Enable FP16 as requested
         'gradient_accumulation_steps': config['training']['accumulate_grad_batches'],
@@ -224,7 +296,7 @@ def setup_4gpu_accelerator(config):
                 # Remove timeout_seconds as it doesn't exist in newer versions
             )
             accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
-            print("✅ DDP kwargs configured with find_unused_parameters=False")
+            print("✅ DDP kwargs configured with find_unused_parameters=False for log-mel training")
         except Exception as e:
             print(f"⚠️ DDP kwargs setup failed: {e}")
     
@@ -241,15 +313,17 @@ def setup_4gpu_accelerator(config):
     if accelerator.num_processes != 4:
         print(f"⚠️ Expected 4 GPUs, but got {accelerator.num_processes}")
         if accelerator.num_processes == 1:
-            print("💡 Running in single-GPU mode")
+            print("💡 Running in single-GPU mode for log-mel training")
     else:
-        print(f"✅ V100×4 setup verified")
+        print(f"✅ V100×4 setup verified for log-mel + phase architecture")
     
     if accelerator.is_main_process:
-        print(f"🚀 V100×4 Training Setup:")
+        print(f"🚀 V100×4 Log-mel Training Setup:")
         print(f"   📊 Processes: {accelerator.num_processes}")
         print(f"   🔄 Mixed precision: {accelerator.mixed_precision}")
         print(f"   🔢 Gradient accumulation: {config['training']['accumulate_grad_batches']}")
+        print(f"   🎵 Mel bins: {N_MELS}")
+        print(f"   📐 Architecture: Log-mel + phase preservation")
         effective_batch = (config['training']['batch_size'] * 
                           config['training']['accumulate_grad_batches'] * 
                           accelerator.num_processes)
@@ -258,7 +332,7 @@ def setup_4gpu_accelerator(config):
     return accelerator
 
 def setup_data_loader(config: Dict[str, Any], accelerator: Accelerator):
-    """Setup data loader with improved deterministic behavior"""
+    """Setup data loader with improved deterministic behavior for log-mel training"""
     sample_rate = config.get('audio', {}).get('sample_rate', 44100)
     file_limit = config['data'].get('file_limit', None)
     
@@ -282,7 +356,7 @@ def setup_data_loader(config: Dict[str, Any], accelerator: Accelerator):
         np.random.seed(worker_seed)
         random.seed(worker_seed)
     
-    # Optimized DataLoader settings
+    # Optimized DataLoader settings for log-mel processing
     pin_memory = get_optimal_pin_memory()
     num_workers = config['training']['num_workers']
     
@@ -298,10 +372,16 @@ def setup_data_loader(config: Dict[str, Any], accelerator: Accelerator):
         worker_init_fn=worker_init_fn if num_workers > 0 else None
     )
     
+    if accelerator.is_main_process:
+        print(f"✅ DataLoader configured for log-mel training:")
+        print(f"   Batch size: {config['training']['batch_size']}")
+        print(f"   Workers: {num_workers}")
+        print(f"   Pin memory: {pin_memory}")
+    
     return dataloader
 
 def create_validation_loader(config: Dict[str, Any], accelerator: Accelerator):
-    """Create validation data loader"""
+    """Create validation data loader for log-mel architecture"""
     val_config = config.copy()
     val_config['data']['samples_per_track'] = 1
     val_config['training']['batch_size'] = max(1, config['training']['batch_size'] // 2)
@@ -309,7 +389,7 @@ def create_validation_loader(config: Dict[str, Any], accelerator: Accelerator):
     return setup_data_loader(val_config, accelerator)
 
 def validate_environment():
-    """Validate training environment"""
+    """Validate training environment for log-mel architecture"""
     if not torch.cuda.is_available():
         print("❌ CUDA not available")
         return False
@@ -324,13 +404,25 @@ def validate_environment():
             props = torch.cuda.get_device_properties(i)
             memory_gb = props.total_memory / (1024**3)
             print(f"🔧 GPU {i}: {props.name}, Memory: {memory_gb:.1f}GB")
+            if memory_gb < 15:
+                print(f"⚠️ GPU {i} has less than 16GB memory, may cause issues with log-mel training")
         except Exception as e:
             print(f"⚠️ Error checking GPU {i}: {e}")
+    
+    # Check for log-mel specific requirements
+    try:
+        # Test mel filterbank creation
+        from lycodec.audio import create_mel_filterbank
+        mel_filterbank = create_mel_filterbank(n_mels=N_MELS)
+        print(f"✅ Mel filterbank test: {mel_filterbank.shape} ({N_MELS} mel bins)")
+    except Exception as e:
+        print(f"❌ Mel filterbank test failed: {e}")
+        return False
     
     return True
 
 def validate_config(config):
-    """Validate and convert config values to proper types"""
+    """Validate and convert config values to proper types for log-mel training"""
     training = config.get('training', {})
     training['learning_rate'] = float(training.get('learning_rate', 1e-4))
     training['batch_size'] = int(training.get('batch_size', 1))
@@ -351,15 +443,39 @@ def validate_config(config):
     audio['sample_rate'] = int(audio.get('sample_rate', 44100))
     
     config['seed'] = int(config.get('seed', 42))
+    
+    # Validate mel-specific settings
+    if 'n_mels' in audio:
+        audio['n_mels'] = int(audio['n_mels'])
+        if audio['n_mels'] != N_MELS:
+            print(f"⚠️ Config n_mels ({audio['n_mels']}) differs from architecture ({N_MELS}), using {N_MELS}")
+            audio['n_mels'] = N_MELS
+    else:
+        audio['n_mels'] = N_MELS
+    
     return config
 
 def main():
-    parser = argparse.ArgumentParser(description='Train LyCodec v2.0 - FIXED VERSION')
+    parser = argparse.ArgumentParser(description='Train LyCodec v2.0 - LOG-MEL + PHASE ARCHITECTURE')
     parser.add_argument('--config', type=str, default='config.yaml',
                        help='Configuration file path')
     parser.add_argument('--resume', type=str, default=None,
                        help='Resume from specific checkpoint')
+    parser.add_argument('--test-architecture', action='store_true',
+                       help='Test log-mel + phase architecture and exit')
     args = parser.parse_args()
+    
+    # Quick architecture test
+    if args.test_architecture:
+        print("🧪 Testing log-mel + phase architecture...")
+        try:
+            from lycodec import quick_test, print_architecture_summary
+            print_architecture_summary()
+            success = quick_test()
+            sys.exit(0 if success else 1)
+        except Exception as e:
+            print(f"❌ Architecture test failed: {e}")
+            sys.exit(1)
     
     # Validate environment
     if not validate_environment():
@@ -376,14 +492,14 @@ def main():
     
     config = validate_config(config)
     
-    # CRITICAL: Setup Accelerator with DDP fixes
+    # CRITICAL: Setup Accelerator with DDP fixes for log-mel
     accelerator = setup_4gpu_accelerator(config)
     
     # CRITICAL: Setup isolated RNG states to prevent mt19937 errors
     base_seed = config.get('seed', 42)
     setup_safe_rng_state(accelerator, base_seed)
     
-    # Setup data loading
+    # Setup data loading for log-mel training
     dataloader = setup_data_loader(config, accelerator)
     
     # CRITICAL: Prepare DataLoader and immediately disable RNG synchronization
@@ -401,16 +517,18 @@ def main():
     total_steps = steps_per_epoch * config['training']['num_epochs']
     
     if accelerator.is_main_process:
-        print(f"📊 Training Configuration:")
+        print(f"📊 Log-mel Training Configuration:")
         print(f"   🔢 Steps per epoch: {steps_per_epoch}")
         print(f"   🔢 Total steps: {total_steps}")
         print(f"   📦 Batch size per GPU: {config['training']['batch_size']}")
+        print(f"   🎵 Mel bins: {N_MELS}")
+        print(f"   📐 Architecture: Log-mel + phase preservation")
         effective_batch = (config['training']['batch_size'] * 
                           config['training']['accumulate_grad_batches'] * 
                           accelerator.num_processes)
         print(f"   📦 Effective batch size: {effective_batch}")
     
-    # Setup trainer
+    # Setup trainer for log-mel architecture
     sample_rate = config.get('audio', {}).get('sample_rate', 44100)
     
     trainer = LyCodecTrainer(
@@ -428,42 +546,46 @@ def main():
         accelerator=accelerator
     )
     
-    # CRITICAL: Verify DDP compatibility
+    # CRITICAL: Verify DDP compatibility for log-mel architecture
     if accelerator.is_main_process:
-        print("🔍 Running DDP compatibility checks...")
+        print("🔍 Running DDP compatibility checks for log-mel + phase architecture...")
     trainer.verify_ddp_compatibility()
     
-    # Initialize wandb
+    # Initialize wandb for log-mel training
     if accelerator.is_main_process and config.get('wandb', {}).get('enabled', True):
         wandb_config = {
-            'project': config.get('wandb', {}).get('project', 'lycodec-v2-fixed'),
-            'name': f"lycodec-v2-{base_seed}-fixed",
+            'project': config.get('wandb', {}).get('project', 'lycodec-v2-logmel'),
+            'name': f"lycodec-logmel-{base_seed}",
             'config': {
                 **config,
                 'num_processes': accelerator.num_processes,
                 'effective_batch_size': effective_batch,
                 'total_steps': total_steps,
-                'version': '2.0-fixed',
+                'version': '2.0-logmel',
+                'architecture': 'log_mel_phase',
+                'mel_bins': N_MELS,
+                'compression_ratio': 100,  # f10c10
                 'fixes_applied': {
                     'rng_isolation': True,
                     'ddp_unused_params': True,
-                    'tensor_dimension_fixes': True,
+                    'log_mel_phase_architecture': True,
+                    'psychoacoustic_masking': True,
                     'memory_optimizations': True
                 }
             },
-            'tags': config.get('wandb', {}).get('tags', ['lycodec', 'v2.0', 'fixed']),
-            'notes': 'LyCodec v2.0 with critical fixes for RNG, DDP, and tensor issues'
+            'tags': config.get('wandb', {}).get('tags', ['lycodec', 'v2.0', 'log-mel', 'phase']),
+            'notes': 'LyCodec v2.0 with log-mel + phase architecture, psychoacoustic masking, and critical fixes'
         }
         trainer.setup_wandb(wandb_config)
     
-    # Setup validation
+    # Setup validation for log-mel training
     val_dataloader = None
     if config.get('validation', {}).get('val_split', 0) > 0:
         val_dataloader = create_validation_loader(config, accelerator)
         if accelerator.is_main_process:
-            print(f"✅ Validation loader created")
+            print(f"✅ Validation loader created for log-mel architecture")
     
-    # Training loop
+    # Training loop for log-mel + phase architecture
     start_epoch = 0
     best_loss = float('inf')
     
@@ -471,23 +593,23 @@ def main():
     checkpoint_dir = Path(config['training']['checkpoint_dir'])
     checkpoint_dir.mkdir(exist_ok=True)
     
-    latest_checkpoint = checkpoint_dir / 'latest.pt'
+    latest_checkpoint = checkpoint_dir / 'latest_logmel.pt'
     if latest_checkpoint.exists():
         start_epoch, losses = trainer.load_checkpoint(latest_checkpoint)
         best_loss = losses.get('total_loss', best_loss)
         if accelerator.is_main_process:
-            print(f"🔄 Resumed from epoch {start_epoch}")
+            print(f"🔄 Resumed log-mel training from epoch {start_epoch}")
     
-    # CRITICAL: Main training loop with enhanced error handling
+    # CRITICAL: Main training loop with log-mel + phase architecture
     avg_losses = {'total_loss': float('inf')}
     epoch = start_epoch
     
     try:
         for epoch in range(start_epoch, config['training']['num_epochs']):
             if accelerator.is_main_process:
-                print(f"🚀 Epoch {epoch}/{config['training']['num_epochs']} [FIXED]")
+                print(f"🚀 Epoch {epoch}/{config['training']['num_epochs']} [LOG-MEL+PHASE]")
             
-            # Train epoch with critical fixes
+            # Train epoch with log-mel + phase architecture
             avg_losses = trainer.train_epoch(dataloader, epoch)
             
             # Validation
@@ -506,13 +628,13 @@ def main():
                 current_loss = val_losses.get('val_total_loss', avg_losses['total_loss'])
                 if current_loss < best_loss:
                     best_loss = current_loss
-                    best_checkpoint = checkpoint_dir / 'best.pt'
+                    best_checkpoint = checkpoint_dir / 'best_logmel.pt'
                     trainer.save_checkpoint(epoch, all_losses, best_checkpoint)
-                    print(f"🏆 New best model: {best_loss:.6f}")
+                    print(f"🏆 New best log-mel model: {best_loss:.6f}")
                 
                 # Save periodic
                 if (epoch + 1) % config['training']['save_every'] == 0:
-                    periodic_checkpoint = checkpoint_dir / f'epoch_{epoch:04d}.pt'
+                    periodic_checkpoint = checkpoint_dir / f'logmel_epoch_{epoch:04d}.pt'
                     trainer.save_checkpoint(epoch, all_losses, periodic_checkpoint)
             
             # Log results
@@ -524,14 +646,14 @@ def main():
     
     except KeyboardInterrupt:
         if accelerator.is_main_process:
-            print("\n⏹️ Training interrupted")
-            emergency_checkpoint = checkpoint_dir / f'interrupted_epoch_{epoch}_fixed.pt'
+            print("\n⏹️ Log-mel training interrupted")
+            emergency_checkpoint = checkpoint_dir / f'interrupted_logmel_epoch_{epoch}.pt'
             trainer.save_checkpoint(epoch, avg_losses, emergency_checkpoint)
-            print(f"💾 Emergency checkpoint saved: {emergency_checkpoint}")
+            print(f"💾 Emergency log-mel checkpoint saved: {emergency_checkpoint}")
     
     except Exception as e:
         if accelerator.is_main_process:
-            print(f"\n❌ Training failed: {e}")
+            print(f"\n❌ Log-mel training failed: {e}")
             import traceback
             traceback.print_exc()
         raise
@@ -540,10 +662,12 @@ def main():
         # Cleanup
         trainer.cleanup_wandb()
         if accelerator.is_main_process:
-            print("🏁 Training completed!")
+            print("🏁 Log-mel + Phase training completed!")
             print(f"   🏆 Best loss: {best_loss:.6f}")
             print(f"   📅 Epochs: {epoch + 1}")
             print(f"   💾 Checkpoints in: {checkpoint_dir}")
+            print(f"   🎵 Architecture: Log-mel + phase with {N_MELS} mel bins")
+            print(f"   📊 Compression: f10c10 (100x)")
 
 if __name__ == '__main__':
     main()

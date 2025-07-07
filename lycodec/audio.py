@@ -11,7 +11,7 @@ import importlib.util
 SAMPLE_RATE = 44100
 N_FFT = 2048
 HOP_LENGTH = 512  # f10 compression in time
-N_MELS = 128
+N_MELS = 128  # Mel bands
 F_MIN = 20
 F_MAX = 22050
 
@@ -274,6 +274,126 @@ def istft_transform(stft_tensor, n_fft=N_FFT, hop_length=HOP_LENGTH, window='han
     
     return waveform
 
+def create_mel_filterbank(n_mels=N_MELS, n_fft=N_FFT, sample_rate=SAMPLE_RATE, f_min=F_MIN, f_max=F_MAX):
+    """
+    Create mel-scale filterbank matrix for STFT magnitude conversion
+    """
+    # Calculate frequency points
+    freq_points = torch.linspace(0, sample_rate // 2, n_fft // 2 + 1)
+    
+    # Convert to mel scale
+    def hz_to_mel(hz):
+        return 2595 * torch.log10(1 + hz / 700)
+    
+    def mel_to_hz(mel):
+        return 700 * (10**(mel / 2595) - 1)
+    
+    # Create mel points
+    mel_min = hz_to_mel(torch.tensor(f_min, dtype=torch.float32))
+    mel_max = hz_to_mel(torch.tensor(f_max, dtype=torch.float32))
+    mel_points = torch.linspace(mel_min, mel_max, n_mels + 2)
+    hz_points = mel_to_hz(mel_points)
+    
+    # Create filter bank
+    filterbank = torch.zeros(n_mels, n_fft // 2 + 1)
+    
+    for m in range(n_mels):
+        left = hz_points[m]
+        center = hz_points[m + 1]
+        right = hz_points[m + 2]
+        
+        # Find frequency bin indices
+        for k, freq in enumerate(freq_points):
+            if left <= freq <= center:
+                filterbank[m, k] = (freq - left) / (center - left)
+            elif center <= freq <= right:
+                filterbank[m, k] = (right - freq) / (right - center)
+    
+    return filterbank
+
+def to_mel_spectrogram(magnitude_spec, mel_filterbank=None):
+    """
+    Convert magnitude spectrogram to mel-scale
+    Args:
+        magnitude_spec: [B, F, T] magnitude spectrogram
+        mel_filterbank: [n_mels, F] mel filterbank matrix
+    Returns:
+        mel_spec: [B, n_mels, T] mel spectrogram
+    """
+    device = magnitude_spec.device
+    dtype = magnitude_spec.dtype
+    
+    if mel_filterbank is None:
+        mel_filterbank = create_mel_filterbank()
+    
+    mel_filterbank = mel_filterbank.to(device=device, dtype=dtype)
+    
+    # Apply mel filterbank: [n_mels, F] @ [B, F, T] -> [B, n_mels, T]
+    B, F, T = magnitude_spec.shape
+    
+    # Reshape for proper matrix multiplication: [B, F, T] -> [B*T, F]
+    magnitude_flat = magnitude_spec.transpose(1, 2).reshape(-1, F)  # [B*T, F]
+    
+    # Apply mel filterbank: [n_mels, F] @ [B*T, F].T -> [n_mels, B*T]
+    mel_flat = torch.matmul(mel_filterbank, magnitude_flat.T)  # [n_mels, B*T]
+    
+    # Reshape back: [n_mels, B*T] -> [B, n_mels, T]
+    mel_spec = mel_flat.T.reshape(B, T, -1).transpose(1, 2)  # [B, n_mels, T]
+    
+    return mel_spec
+
+def to_log_mel(mel_spec, eps=1e-10):
+    """
+    Convert mel spectrogram to log scale
+    """
+    return torch.log(torch.clamp(mel_spec, min=eps))
+
+def from_log_mel(log_mel_spec):
+    """
+    Convert log mel spectrogram back to linear scale
+    """
+    return torch.exp(log_mel_spec)
+
+def mel_to_magnitude(mel_spec, mel_filterbank=None, n_fft=N_FFT):
+    """
+    Convert mel spectrogram back to magnitude spectrogram using pseudo-inverse
+    Args:
+        mel_spec: [B, n_mels, T] mel spectrogram
+        mel_filterbank: [n_mels, F] mel filterbank matrix
+        n_fft: FFT size for output frequency bins
+    Returns:
+        magnitude_spec: [B, F, T] magnitude spectrogram
+    """
+    device = mel_spec.device
+    dtype = mel_spec.dtype
+    
+    if mel_filterbank is None:
+        mel_filterbank = create_mel_filterbank(n_fft=n_fft)
+    
+    mel_filterbank = mel_filterbank.to(device=device, dtype=dtype)
+    
+    # Compute pseudo-inverse of mel filterbank
+    try:
+        mel_filterbank_pinv = torch.pinverse(mel_filterbank)
+    except Exception as e:
+        print(f"⚠️ Pseudo-inverse failed: {e}, using transpose")
+        # Fallback to transpose (less accurate but stable)
+        mel_filterbank_pinv = mel_filterbank.T
+    
+    # Apply inverse: [F, n_mels] @ [B, n_mels, T] -> [B, F, T]
+    B, n_mels, T = mel_spec.shape
+    
+    # Reshape for proper matrix multiplication: [B, n_mels, T] -> [B*T, n_mels]
+    mel_flat = mel_spec.transpose(1, 2).reshape(-1, n_mels)  # [B*T, n_mels]
+    
+    # Apply inverse: [F, n_mels] @ [B*T, n_mels].T -> [F, B*T]
+    magnitude_flat = torch.matmul(mel_filterbank_pinv.T, mel_flat.T)  # [F, B*T]
+    
+    # Reshape back: [F, B*T] -> [B, F, T]
+    magnitude_spec = magnitude_flat.T.reshape(B, T, -1).transpose(1, 2)  # [B, F, T]
+    
+    return magnitude_spec
+
 def high_quality_resample(audio, orig_sr, target_sr):
     """High-quality resampling with enhanced error handling"""
     if HAS_SOXR:
@@ -430,23 +550,22 @@ class GammatoneFilterbank(nn.Module):
     def forward(self, magnitude_spectrum):
         """
         CRITICAL: Enhanced forward pass ensuring gradient flow
+        Now operates on mel-scale input [B, n_mels, T]
         """
         try:
-            B, F, T = magnitude_spectrum.shape
+            B, n_mels, T = magnitude_spectrum.shape
             
-            # Create frequency grid with proper dtype matching
-            freq_grid = torch.linspace(
-                0, self.sample_rate // 2, F, 
-                device=magnitude_spectrum.device,
-                dtype=magnitude_spectrum.dtype
-            )
+            # Map mel bins to approximate frequency ranges for gammatone filtering
+            mel_freq_centers = torch.linspace(F_MIN, F_MAX, n_mels, 
+                                            device=magnitude_spectrum.device,
+                                            dtype=magnitude_spectrum.dtype)
             
             # Ensure buffers match input precision
             center_freqs = self.center_freqs.to(magnitude_spectrum.dtype)
             erb_widths = self.erb_widths.to(magnitude_spectrum.dtype)
             
-            # Vectorized gammatone responses
-            freq_diff = freq_grid.unsqueeze(1) - center_freqs.unsqueeze(0)
+            # Vectorized gammatone responses on mel-scale input
+            freq_diff = mel_freq_centers.unsqueeze(1) - center_freqs.unsqueeze(0)
             
             sample_rate_tensor = torch.tensor(
                 self.sample_rate, 
@@ -460,8 +579,8 @@ class GammatoneFilterbank(nn.Module):
             # CRITICAL: Apply learnable weights to ensure parameter usage
             weighted_responses = responses * self.filter_weights.unsqueeze(0)
             
-            # Apply filters
-            magnitude_reshaped = magnitude_spectrum.permute(0, 2, 1).contiguous().view(-1, F)
+            # Apply filters: [B, n_mels, T] -> [B, n_filters, T]
+            magnitude_reshaped = magnitude_spectrum.permute(0, 2, 1).contiguous().view(-1, n_mels)
             filtered_reshaped = torch.matmul(magnitude_reshaped, weighted_responses)
             filtered_output = filtered_reshaped.view(B, T, self.n_filters).permute(0, 2, 1)
             
@@ -473,7 +592,7 @@ class GammatoneFilterbank(nn.Module):
         except Exception as e:
             print(f"⚠️ GammatoneFilterbank failed: {e}")
             # Return dummy output with correct shape and gradients
-            B, F, T = magnitude_spectrum.shape
+            B, n_mels, T = magnitude_spectrum.shape
             dummy_output = torch.zeros(B, self.n_filters, T, 
                                      device=magnitude_spectrum.device,
                                      dtype=magnitude_spectrum.dtype)
@@ -658,140 +777,65 @@ def dynamic_range_compression(magnitude, ratio=4.0, threshold=0.1, knee_width=0.
 
 class SpectralLoss(nn.Module):
     """
-    CRITICAL: Multi-scale spectral loss with comprehensive error handling and gradient flow
-    Enhanced for spectrum-domain training with DDP compatibility
+    CRITICAL: Multi-scale spectral loss adapted for log-mel domain
+    Enhanced for mel-scale training with DDP compatibility
     """
-    def __init__(self, n_ffts=[512, 1024, 2048], alpha=1.0, beta=1.0, gamma=1.0, use_triton=False):
+    def __init__(self, n_mels=N_MELS, alpha=1.0, beta=1.0, gamma=1.0, use_triton=False):
         super().__init__()
-        self.n_ffts = n_ffts
+        self.n_mels = n_mels
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
         self.use_triton = False  # Force disable
         
+        # Create mel filterbank
+        self.register_buffer('mel_filterbank', create_mel_filterbank(n_mels=n_mels))
+        
         # CRITICAL: Learnable parameters to ensure gradient flow
-        self.scale_weights = nn.Parameter(torch.ones(len(n_ffts)))
+        self.scale_weights = nn.Parameter(torch.ones(3))  # 3 scales: mel, log_mel, phase
         self.loss_bias = nn.Parameter(torch.zeros(1))
         
-        print(f"✅ SpectralLoss: Stable PyTorch with gradient enhancement")
-        
-    def spectral_convergence_loss(self, pred_stft, target_stft):
-        """Spectral convergence loss with numerical stability"""
-        try:
-            pred_mag = torch.abs(pred_stft)
-            target_mag = torch.abs(target_stft)
-            
-            numerator = torch.norm(target_mag - pred_mag, p='fro')
-            denominator = torch.norm(target_mag, p='fro')
-            
-            return numerator / (denominator + 1e-8)
-        except Exception as e:
-            print(f"⚠️ Spectral convergence loss failed: {e}")
-            return torch.tensor(0.0, device=pred_stft.device, requires_grad=True)
-        
-    def forward(self, pred_input, target_input):
+        print(f"✅ SpectralLoss: Mel-scale domain with gradient enhancement")
+    
+    def forward(self, pred_log_mel, target_log_mel, pred_phase=None, target_phase=None):
         """
-        CRITICAL: Enhanced forward pass with comprehensive error handling
-        Supports both audio and complex spectrogram inputs
+        CRITICAL: Enhanced forward pass for log-mel domain
         """
         try:
-            # Check if inputs are complex spectrograms
-            if torch.is_complex(pred_input) and torch.is_complex(target_input):
-                return self._spectrum_domain_loss(pred_input, target_input)
-            else:
-                return self._audio_domain_loss(pred_input, target_input)
+            device = pred_log_mel.device
+            
+            # 1. Log-mel magnitude loss
+            log_mel_loss = F.l1_loss(pred_log_mel, target_log_mel)
+            
+            # 2. Mel-scale loss (convert back to linear)
+            pred_mel = from_log_mel(pred_log_mel)
+            target_mel = from_log_mel(target_log_mel)
+            mel_loss = F.mse_loss(pred_mel, target_mel)
+            
+            # 3. Phase loss if provided
+            phase_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            if pred_phase is not None and target_phase is not None:
+                # Compute phase difference with magnitude weighting
+                magnitude_weight = target_mel / (target_mel.amax(dim=(-1, -2), keepdim=True) + 1e-8)
+                phase_diff_cos = torch.cos(pred_phase - target_phase)
+                weighted_phase_loss = (1 - phase_diff_cos) * magnitude_weight
+                phase_loss = weighted_phase_loss.mean()
+            
+            # CRITICAL: Apply learnable scale weights
+            total_loss = (
+                self.scale_weights[0] * self.alpha * log_mel_loss +
+                self.scale_weights[1] * self.beta * mel_loss +
+                self.scale_weights[2] * self.gamma * phase_loss +
+                self.loss_bias
+            )
+            
+            return total_loss
+            
         except Exception as e:
             print(f"⚠️ SpectralLoss forward failed: {e}")
-            # Return safe fallback loss with gradients on the same device as the bias parameter
+            # Return safe fallback loss with gradients
             device = self.loss_bias.device
             return torch.tensor(1.0, device=device, requires_grad=True) + self.loss_bias
-    
-    def _spectrum_domain_loss(self, pred_complex, target_complex):
-        """CRITICAL: Direct spectrum-domain loss with error handling"""
-        try:
-            total_loss = torch.tensor(0.0, device=pred_complex.device, requires_grad=True)
-            
-            # Handle multi-channel input
-            if pred_complex.dim() == 4:  # [B, C, F, T]
-                for ch in range(pred_complex.shape[1]):
-                    pred_ch = pred_complex[:, ch]
-                    target_ch = target_complex[:, ch]
-                    channel_loss = self._compute_spectrum_loss(pred_ch, target_ch)
-                    total_loss = total_loss + channel_loss
-                total_loss = total_loss / pred_complex.shape[1]
-            else:
-                total_loss = self._compute_spectrum_loss(pred_complex, target_complex)
-            
-            # CRITICAL: Add learnable parameter contribution
-            total_loss = total_loss + self.loss_bias
-            
-            return total_loss
-            
-        except Exception as e:
-            print(f"⚠️ Spectrum domain loss failed: {e}")
-            return torch.tensor(1.0, device=pred_complex.device, requires_grad=True) + self.loss_bias
-    
-    def _compute_spectrum_loss(self, pred_stft, target_stft):
-        """Compute loss for single spectrum with comprehensive error handling"""
-        try:
-            # Magnitude loss
-            pred_mag = torch.abs(pred_stft)
-            target_mag = torch.abs(target_stft)
-            mag_loss = F.l1_loss(pred_mag, target_mag)
-            
-            # Spectral convergence loss
-            sc_loss = self.spectral_convergence_loss(pred_stft, target_stft)
-            
-            # Phase loss with magnitude weighting
-            magnitude_mask = target_mag > 0.01 * target_mag.max()
-            if magnitude_mask.any():
-                pred_phase = torch.angle(pred_stft)
-                target_phase = torch.angle(target_stft)
-                
-                phase_diff_cos = torch.cos(pred_phase - target_phase)
-                phase_loss = 1.0 - phase_diff_cos[magnitude_mask].mean()
-            else:
-                phase_loss = torch.tensor(0.0, device=pred_stft.device, requires_grad=True)
-            
-            return self.alpha * mag_loss + self.beta * phase_loss + self.gamma * sc_loss
-            
-        except Exception as e:
-            print(f"⚠️ Spectrum loss computation failed: {e}")
-            return torch.tensor(1.0, device=pred_stft.device, requires_grad=True)
-    
-    def _audio_domain_loss(self, pred_audio, target_audio):
-        """Traditional multi-scale STFT loss with error handling"""
-        try:
-            total_loss = torch.tensor(0.0, device=pred_audio.device, requires_grad=True)
-            
-            for i, n_fft in enumerate(self.n_ffts):
-                hop_length = n_fft // 4
-                
-                try:
-                    # Compute STFTs
-                    pred_stft = stft_transform(pred_audio, n_fft=n_fft, hop_length=hop_length)
-                    target_stft = stft_transform(target_audio, n_fft=n_fft, hop_length=hop_length)
-                    
-                    scale_loss = self._compute_spectrum_loss(pred_stft, target_stft)
-                    
-                    # CRITICAL: Apply learnable scale weights
-                    weighted_loss = scale_loss * self.scale_weights[i]
-                    total_loss = total_loss + weighted_loss
-                    
-                except Exception as e:
-                    print(f"⚠️ STFT scale {n_fft} failed: {e}")
-                    # Add dummy loss to maintain gradient flow
-                    dummy_loss = torch.tensor(0.1, device=pred_audio.device, requires_grad=True)
-                    total_loss = total_loss + dummy_loss * self.scale_weights[i]
-            
-            # CRITICAL: Ensure all scale_weights participate
-            total_loss = total_loss / len(self.n_ffts) + self.loss_bias
-            
-            return total_loss
-            
-        except Exception as e:
-            print(f"⚠️ Audio domain loss failed: {e}")
-            return torch.tensor(1.0, device=pred_audio.device, requires_grad=True) + self.loss_bias
 
 def apply_window_function(signal, window_type='hann', fade_in=True, fade_out=True):
     """Apply window function with error handling"""

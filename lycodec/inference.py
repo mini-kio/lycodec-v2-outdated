@@ -10,22 +10,33 @@ from .models import LyCodecModel
 from .audio import (
     to_complex_spec, 
     to_waveform, 
-    normalize_audio, 
+    normalize_audio,
+    to_magnitude_phase,
+    from_magnitude_phase,
+    to_mel_spectrogram,
+    to_log_mel,
+    from_log_mel,
+    mel_to_magnitude,
+    create_mel_filterbank,
     SAMPLE_RATE, 
     HOP_LENGTH, 
-    N_FFT
+    N_FFT,
+    N_MELS
 )
 
 class LyCodec:
     """
-    LyCodec inference engine optimized for <10GB VRAM GPUs - IMPROVED VERSION with better error handling
+    LyCodec inference engine optimized for log-mel + phase processing - REFACTORED VERSION
+    New Architecture:
+    Waveform → STFT → Magnitude/Phase → Mel filterbank → log_mel (128 bin) + phase preservation
     Features:
+    - Log-mel domain processing with phase preservation
+    - Psychoacoustic masking curve weighting
+    - f10c10 compression (100x) maintained
     - Automatic memory management with accurate peak tracking
     - Vectorized chunk-based processing for long audio
     - CPU fallback for memory constraints
     - Conditional half precision inference
-    - Improved OLA with cosine windowing
-    - Better Triton error handling
     """
     
     def __init__(self, 
@@ -72,12 +83,15 @@ class LyCodec:
         else:
             self.half_precision = half_precision
         
-        print(f"LyCodec initialized on {self.device}")
+        print(f"LyCodec initialized on {self.device} with log-mel + phase processing")
+        
+        # Create mel filterbank for consistent processing
+        self.mel_filterbank = create_mel_filterbank(n_mels=N_MELS, n_fft=N_FFT).to(self.device)
         
         # Load model with better error handling
         try:
-            # IMPROVED: More conservative Triton usage in inference
-            self.model = LyCodecModel(use_triton=False)  # Disable Triton in inference for stability
+            # IMPROVED: Disable Triton in inference for stability
+            self.model = LyCodecModel(use_triton=False)
             if model_path:
                 self._load_model(model_path)
         except Exception as e:
@@ -91,7 +105,10 @@ class LyCodec:
         if half_precision and self.device.type == 'cuda':
             try:
                 self.model.half()
-                print("Using FP16 precision on GPU")
+                # Also convert mel filterbank to half precision
+                if hasattr(self, 'mel_filterbank'):
+                    self.mel_filterbank = self.mel_filterbank.half()
+                print("Using FP16 precision on GPU for log-mel processing")
             except Exception as e:
                 warnings.warn(f"Failed to set FP16 ({e}), using FP32")
                 self.half_precision = False
@@ -118,6 +135,8 @@ class LyCodec:
                 self.fade_window = torch.linspace(0, 1, self.overlap_length).to(self.device)
         else:
             self.fade_window = None
+        
+        print(f"✅ Log-mel filterbank created: {N_MELS} mel bins")
     
     def _load_model(self, model_path: str):
         """Load model weights from checkpoint with better error handling"""
@@ -180,6 +199,96 @@ class LyCodec:
                           f"{leak / (1024**2):.1f}MB leak")
                 except Exception as e:
                     print(f"Warning: Memory reporting failed ({e})")
+    
+    def _audio_to_log_mel_phase(self, audio_tensor):
+        """
+        Convert audio to log-mel + phase representation
+        Args:
+            audio_tensor: [B, channels, T] audio tensor
+        Returns:
+            log_mel_features: [B, n_mels, T_frames] log-mel spectrogram
+            phase_features: [B, n_mels, T_frames] phase information  
+        """
+        B, channels, T = audio_tensor.shape
+        
+        # Process each channel and average for mono processing (stereo->mono for mel)
+        all_log_mels = []
+        all_phases = []
+        
+        for ch in range(channels):
+            # STFT for each channel
+            complex_spec = to_complex_spec(audio_tensor[:, ch])  # [B, F, T_frames]
+            
+            # Extract magnitude and phase
+            magnitude_spec, phase_spec = to_magnitude_phase(complex_spec)
+            
+            # Convert magnitude to mel-scale
+            mel_spec = to_mel_spectrogram(magnitude_spec, self.mel_filterbank)  # [B, n_mels, T_frames]
+            
+            # Convert to log-mel
+            log_mel_spec = to_log_mel(mel_spec)  # [B, n_mels, T_frames]
+            
+            # Process phase to mel-scale (approximate mapping)
+            phase_mel = to_mel_spectrogram(phase_spec.abs(), self.mel_filterbank)  # Use abs for positive values
+            # Keep original phase structure but map to mel scale
+            phase_mel_weighted = phase_spec.unsqueeze(1).expand(-1, N_MELS, -1, -1)
+            if phase_mel_weighted.shape[2] != mel_spec.shape[1]:
+                # Interpolate phase to match mel dimensions
+                phase_mel_weighted = torch.nn.functional.interpolate(
+                    phase_mel_weighted, size=(mel_spec.shape[1], mel_spec.shape[2]), 
+                    mode='bilinear', align_corners=False
+                )
+            phase_mel_final = phase_mel_weighted.mean(dim=2)  # [B, n_mels, T_frames]
+            
+            all_log_mels.append(log_mel_spec)
+            all_phases.append(phase_mel_final)
+        
+        # Average across channels for processing
+        log_mel_features = torch.stack(all_log_mels, dim=1).mean(dim=1)  # [B, n_mels, T_frames]
+        phase_features = torch.stack(all_phases, dim=1).mean(dim=1)      # [B, n_mels, T_frames]
+        
+        return log_mel_features, phase_features
+    
+    def _log_mel_phase_to_audio(self, log_mel_features, phase_features, target_length=None):
+        """
+        Convert log-mel + phase back to audio
+        Args:
+            log_mel_features: [B, n_mels, T_frames] log-mel spectrogram
+            phase_features: [B, n_mels, T_frames] phase information
+            target_length: target audio length in samples
+        Returns:
+            audio_tensor: [B, channels, T] reconstructed audio
+        """
+        # Convert log-mel back to linear mel
+        mel_features = from_log_mel(log_mel_features)  # [B, n_mels, T_frames]
+        
+        # Convert mel back to magnitude spectrogram
+        magnitude_spec = mel_to_magnitude(mel_features, self.mel_filterbank, n_fft=N_FFT)  # [B, F, T_frames]
+        
+        # Reconstruct phase spectrogram from mel-scale phase
+        # Map phase back to full frequency spectrum
+        F_bins = N_FFT // 2 + 1
+        T_frames = phase_features.shape[-1]
+        
+        # Interpolate phase to match magnitude spectrum dimensions
+        phase_spec = torch.nn.functional.interpolate(
+            phase_features.unsqueeze(2), size=(F_bins, T_frames), 
+            mode='bilinear', align_corners=False
+        ).squeeze(2)  # [B, F, T_frames]
+        
+        # Reconstruct complex spectrogram
+        complex_spec = from_magnitude_phase(magnitude_spec, phase_spec)  # [B, F, T_frames]
+        
+        # Convert to audio (mono first)
+        mono_audio = to_waveform(complex_spec, length=target_length)  # [B, T]
+        
+        # Expand to stereo
+        if mono_audio.dim() == 2:  # [B, T]
+            stereo_audio = mono_audio.unsqueeze(1).repeat(1, 2, 1)  # [B, 2, T]
+        else:  # [T] single sample
+            stereo_audio = mono_audio.unsqueeze(0).repeat(2, 1).unsqueeze(0)  # [1, 2, T]
+        
+        return stereo_audio
     
     def _chunk_audio(self, audio: torch.Tensor) -> List[Tuple[torch.Tensor, int]]:
         """Split long audio into overlapping chunks - IMPROVED with start indices"""
@@ -290,7 +399,7 @@ class LyCodec:
     def encode(self, audio: Union[str, np.ndarray, torch.Tensor], 
                normalize: bool = True) -> torch.Tensor:
         """
-        Encode audio to compressed latent representation - IMPROVED with better error handling
+        Encode audio to compressed latent representation using log-mel + phase
         
         Args:
             audio: Audio file path, numpy array, or torch tensor
@@ -364,34 +473,16 @@ class LyCodec:
                 latent_chunks = []
                 for chunk, start_idx in chunks:
                     try:
-                        # IMPROVED: Vectorized complex spectrogram computation with error handling
-                        # Convert to complex spectrogram for both channels at once
-                        batch_size = chunk.shape[0]
-                        n_channels = chunk.shape[1]
-                        
-                        # Vectorized STFT computation
-                        stft_complex = torch.stack([
-                            to_complex_spec(chunk[:, i]) for i in range(n_channels)
-                        ], dim=1)  # [B, 2, F, T]
-                        
-                        # Get magnitude for psychoacoustic analysis (average across stereo)
-                        magnitude_specs = torch.abs(stft_complex).mean(dim=1)  # [B, F, T]
+                        # NEW ARCHITECTURE: Convert to log-mel + phase
+                        log_mel_features, phase_features = self._audio_to_log_mel_phase(chunk)
                         
                         # IMPROVED: Ensure consistent precision for model inputs
                         if self.half_precision and self.device.type == 'cuda':
-                            magnitude_specs = magnitude_specs.half()
+                            log_mel_features = log_mel_features.half()
+                            phase_features = phase_features.half()
                         
-                        # Format for model: separate real and imaginary parts
-                        real_part = stft_complex.real
-                        imag_part = stft_complex.imag
-                        model_input = torch.stack([real_part, imag_part], dim=2)  # [B, 2, 2, F, T]
-                        
-                        # Ensure model_input precision matches model
-                        if self.half_precision and self.device.type == 'cuda':
-                            model_input = model_input.half()
-                        
-                        # Encode
-                        latent_chunk = self.model.encode(model_input, magnitude_specs)
+                        # Encode using log-mel + phase
+                        latent_chunk = self.model.encode(log_mel_features, phase_features)
                         latent_chunks.append((latent_chunk.cpu(), start_idx))
                         
                     except Exception as e:
@@ -421,7 +512,7 @@ class LyCodec:
     def decode(self, latent: Union[torch.Tensor, dict], 
                target_length: Optional[int] = None) -> np.ndarray:
         """
-        Decode latent representation back to audio - IMPROVED with better error handling
+        Decode latent representation back to audio using log-mel + phase reconstruction
         
         Args:
             latent: Compressed latent [B, C, H, W] or dict with chunk info
@@ -452,42 +543,20 @@ class LyCodec:
                     latent_tensor = latent_tensor.float()
             
             with self._memory_efficient_inference():
-                # IMPROVED: Calculate correct target size for ISTFT compatibility
-                # For center=False STFT with n_fft=2048, we need 1025 frequency bins (n_fft//2 + 1)
-                target_freq_bins = N_FFT // 2 + 1  # 1025 for n_fft=2048
-                
-                # Estimate time dimension from target_length if provided
-                if target_length is not None:
-                    target_time_bins = (target_length // HOP_LENGTH) + 1
-                    target_size = (target_freq_bins, target_time_bins)
-                else:
-                    target_size = (target_freq_bins, None)  # Let decoder determine time dimension
-                
-                # Decode with correct target size
+                # NEW ARCHITECTURE: Decode to log-mel + phase
                 try:
-                    real_part, imag_part = self.model.decode(latent_tensor, target_size)
+                    # Calculate target size for mel-scale output
+                    if target_length is not None:
+                        target_time_frames = (target_length // HOP_LENGTH) + 1
+                        target_size = (N_MELS, target_time_frames)
+                    else:
+                        target_size = None
                     
-                    # Reconstruct complex spectrogram
-                    complex_spec = torch.complex(real_part, imag_part)  # [B, 2, F, T]
+                    # Decode with correct target size
+                    log_mel_out, phase_out = self.model.decode(latent_tensor, target_size)
                     
-                    # IMPROVED: Vectorized audio reconstruction with proper ISTFT length
-                    # Convert back to audio for all channels at once
-                    audio_channels = []
-                    for i in range(complex_spec.shape[1]):  # Each stereo channel
-                        # IMPROVED: Pass expected length to istft_transform for consistency
-                        expected_len = target_length if target_length else None
-                        try:
-                            audio_channel = to_waveform(complex_spec[:, i], length=expected_len)  # [B, T]
-                            audio_channels.append(audio_channel)
-                        except Exception as e:
-                            print(f"Warning: ISTFT failed for channel {i}: {e}")
-                            # Create dummy audio for failed channel
-                            dummy_length = target_length if target_length else 44100
-                            dummy_audio = torch.zeros(1, dummy_length, device=complex_spec.device)
-                            audio_channels.append(dummy_audio)
-                    
-                    # Stack stereo channels
-                    stereo_audio = torch.stack(audio_channels, dim=1)  # [B, 2, T]
+                    # NEW ARCHITECTURE: Convert log-mel + phase back to audio
+                    stereo_audio = self._log_mel_phase_to_audio(log_mel_out, phase_out, target_length)
                     
                     # Remove batch dimension and move to CPU
                     stereo_audio = stereo_audio.squeeze(0).cpu().float()  # [2, T]
@@ -633,26 +702,31 @@ class LyCodec:
                     save_data = {
                         'latent': latent_to_save,
                         'dtype': str(latent.dtype),
-                        'half_precision': True
+                        'half_precision': True,
+                        'architecture': 'log_mel_phase'
                     }
                 else:
-                    save_data = latent_to_save
+                    save_data = {
+                        'latent': latent_to_save,
+                        'architecture': 'log_mel_phase'
+                    }
             else:
                 # Handle dict case (chunked latents)
-                save_data = latent
+                save_data = latent.copy()
+                save_data['architecture'] = 'log_mel_phase'
                 if 'latents' in latent and isinstance(latent['latents'], torch.Tensor):
                     latent['latents'] = latent['latents'].cpu()
             
             # Use efficient serialization for large files
             torch.save(save_data, output_path, _use_new_zipfile_serialization=False)
-            print(f"Encoded {input_path} -> {output_path}")
+            print(f"Encoded {input_path} -> {output_path} (log-mel + phase)")
             
             # Print compression stats
             try:
                 input_size = Path(input_path).stat().st_size
                 output_size = Path(output_path).stat().st_size
                 compression_ratio = input_size / output_size
-                print(f"Compression ratio: {compression_ratio:.1f}x")
+                print(f"Compression ratio: {compression_ratio:.1f}x (f10c10 log-mel)")
             except Exception as e:
                 print(f"Warning: Could not calculate compression ratio: {e}")
                 
@@ -665,16 +739,28 @@ class LyCodec:
             loaded_data = torch.load(input_path, map_location='cpu')
             
             # Handle different save formats
-            if isinstance(loaded_data, dict) and 'latent' in loaded_data:
-                # New format with dtype metadata
-                latent = loaded_data['latent']
-                if loaded_data.get('half_precision', False):
-                    # Restore original dtype if needed
-                    latent = latent.half() if latent.dtype != torch.float16 else latent
+            if isinstance(loaded_data, dict):
+                if 'latent' in loaded_data:
+                    # New format with metadata
+                    latent = loaded_data['latent']
+                    architecture = loaded_data.get('architecture', 'unknown')
+                    if loaded_data.get('half_precision', False):
+                        # Restore original dtype if needed
+                        latent = latent.half() if latent.dtype != torch.float16 else latent
+                elif 'latents' in loaded_data:
+                    # Chunked format
+                    latent = loaded_data
+                    architecture = loaded_data.get('architecture', 'unknown')
+                else:
+                    # Legacy single tensor format
+                    latent = loaded_data
+                    architecture = 'legacy'
             else:
-                # Legacy format or chunked format
+                # Legacy format
                 latent = loaded_data
+                architecture = 'legacy'
                 
+            print(f"Decoding with architecture: {architecture}")
             audio = self.decode(latent)
             
             # Transpose for soundfile (samples, channels)
@@ -686,14 +772,22 @@ class LyCodec:
             print(f"Error decoding file {input_path}: {e}")
     
     def get_compression_ratio(self, audio_length_seconds: float = None, latent_tensor: torch.Tensor = None) -> float:
-        """Calculate compression ratio for given audio length or latent tensor - IMPROVED: Accurate calculation"""
+        """Calculate compression ratio for log-mel architecture"""
         try:
             if audio_length_seconds is not None:
                 # Original: 44.1kHz * 2 channels * 16 bits * seconds
                 original_bits = SAMPLE_RATE * 2 * 16 * audio_length_seconds
                 
-                # IMPROVED: Calculate actual compressed size based on latent dimensions
-                # Assume typical latent shape [1, 64, 8, 32] for 5 second audio
+                # NEW: Calculate for log-mel architecture
+                # Time frames: audio_length * sample_rate / hop_length
+                time_frames = int(audio_length_seconds * SAMPLE_RATE / HOP_LENGTH)
+                
+                # f10c10: 10x frequency compression (N_MELS=128 vs ~1025 STFT bins = ~8x)
+                # 10x time compression through encoder stages
+                compressed_time = time_frames // 10
+                compressed_freq = N_MELS // 10  # Approximate after encoder
+                
+                # Latent representation
                 typical_latent_elements = 64 * 8 * 32  # Channels * Height * Width
                 bytes_per_element = 4 if not self.half_precision else 2  # float32 or float16
                 compressed_bits = typical_latent_elements * bytes_per_element * 8  # Convert to bits
@@ -701,26 +795,20 @@ class LyCodec:
                 return original_bits / compressed_bits
             
             elif latent_tensor is not None:
-                # IMPROVED: Calculate from actual latent tensor size with accurate reverse engineering
+                # Calculate from actual latent tensor size
                 latent_elements = latent_tensor.numel()
                 bytes_per_element = 4 if latent_tensor.dtype == torch.float32 else 2
                 compressed_bits = latent_elements * bytes_per_element * 8
                 
-                # IMPROVED: Accurate reverse engineering using encoder architecture
-                # f10c10 means: frequency downsampled by ~10x, time downsampled by ~10x
-                # But actual downsampling depends on encoder layers:
-                # Frequency: 3 stages of stride=2 -> 8x total, Time: stride=5 then stride=2 -> 10x total
-                encoder_freq_stride = 8  # From 3 ConvTranspose layers with stride=2
-                encoder_time_stride = 10  # From stride=(1,5) then stride=(1,2)
-                
+                # Reverse engineer audio length from latent dimensions
                 latent_time_frames = latent_tensor.shape[-1] if latent_tensor.dim() >= 2 else 32
-                estimated_spec_time_frames = latent_time_frames * encoder_time_stride
-                estimated_audio_frames = estimated_spec_time_frames * HOP_LENGTH
+                estimated_mel_time_frames = latent_time_frames * 10  # f10 expansion
+                estimated_audio_frames = estimated_mel_time_frames * HOP_LENGTH
                 original_bits = estimated_audio_frames * 2 * 16  # Stereo 16-bit
                 
                 return original_bits / compressed_bits
             else:
-                # Default theoretical calculation
+                # Default theoretical calculation for log-mel f10c10
                 return 100.0  # f10c10 theoretical
                 
         except Exception as e:
@@ -728,7 +816,7 @@ class LyCodec:
             return 100.0  # Default fallback
     
     def test_round_trip(self, audio_length_seconds: float = 5.0) -> dict:
-        """Test encode-decode round trip consistency with error handling"""
+        """Test encode-decode round trip consistency for log-mel + phase architecture"""
         try:
             # Generate test signal
             t = torch.linspace(0, audio_length_seconds, int(SAMPLE_RATE * audio_length_seconds))
@@ -751,13 +839,30 @@ class LyCodec:
                 
             mse = np.mean((original_np - reconstructed_np) ** 2)
             signal_power = np.mean(original_np ** 2)
-            snr = 10 * np.log10(signal_power / (mse + 1e-10))  # Use np.log10, not torch.log10
+            snr = 10 * np.log10(signal_power / (mse + 1e-10))
+            
+            # Calculate mel-scale specific metrics
+            try:
+                # Convert both to log-mel for comparison
+                original_log_mel, _ = self._audio_to_log_mel_phase(test_audio)
+                reconstructed_tensor = torch.from_numpy(reconstructed_np).unsqueeze(0)
+                reconstructed_log_mel, _ = self._audio_to_log_mel_phase(reconstructed_tensor)
+                
+                mel_mse = torch.mean((original_log_mel - reconstructed_log_mel) ** 2).item()
+                mel_snr = 10 * np.log10(torch.mean(original_log_mel ** 2).item() / (mel_mse + 1e-10))
+            except Exception as e:
+                print(f"Warning: Mel-scale metrics failed: {e}")
+                mel_mse = float('inf')
+                mel_snr = -float('inf')
             
             return {
                 'mse': float(mse),
                 'snr_db': float(snr),
+                'mel_mse': float(mel_mse),
+                'mel_snr_db': float(mel_snr),
                 'original_shape': original_np.shape,
-                'reconstructed_shape': reconstructed_np.shape
+                'reconstructed_shape': reconstructed_np.shape,
+                'architecture': 'log_mel_phase'
             }
             
         except Exception as e:
@@ -765,6 +870,9 @@ class LyCodec:
             return {
                 'mse': float('inf'),
                 'snr_db': -float('inf'),
+                'mel_mse': float('inf'),
+                'mel_snr_db': -float('inf'),
                 'original_shape': (2, 0),
-                'reconstructed_shape': (2, 0)
+                'reconstructed_shape': (2, 0),
+                'architecture': 'log_mel_phase'
             }

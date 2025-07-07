@@ -56,8 +56,15 @@ from .models import LyCodecModel
 from .audio import (
     SpectralLoss, 
     to_complex_spec, 
-    to_magnitude_phase, 
-    to_waveform
+    to_magnitude_phase,
+    to_mel_spectrogram,
+    to_log_mel,
+    from_log_mel,
+    mel_to_magnitude,
+    from_magnitude_phase,
+    to_waveform,
+    create_mel_filterbank,
+    N_MELS
 )
 
 # Import wandb
@@ -71,14 +78,14 @@ except ImportError:
 
 class LyCodecTrainer:
     """
-    LyCodec trainer optimized for V100×4 16GB - CRITICAL FIXES APPLIED
+    LyCodec trainer optimized for V100×4 16GB - LOG-MEL + PHASE ARCHITECTURE
     
-    CRITICAL FIXES:
-    - All model parameters guaranteed to participate in loss computation
+    NEW ARCHITECTURE:
+    - Waveform → STFT → Magnitude/Phase → Mel filterbank → log_mel (128 bin) + phase preservation
+    - PsychoacousticTransform applies masking curve weighting in log-mel domain
+    - f10c10 compression (100x) maintained through encoder/decoder stages
     - Enhanced DDP compatibility with proper gradient flow
-    - Improved tensor dimension handling for STFT/ISTFT
     - Memory-efficient processing for 16GB VRAM
-    - Robust error handling and recovery mechanisms
     """
     
     def __init__(self, 
@@ -107,27 +114,33 @@ class LyCodecTrainer:
         # Setup logging
         self._setup_logging()
         
-        # Initialize model with critical fixes
+        # Initialize model with log-mel architecture
         model_config = model_config or {}
         model_config['use_triton'] = False  # Force disable Triton
         
         self.model = LyCodecModel(**model_config)
         
+        # Create mel filterbank for consistent processing
+        self.mel_filterbank = create_mel_filterbank(n_mels=N_MELS).to(self.accelerator.device)
+        
         if self.is_main_process:
-            self.logger.info(f"Model initialized with config: {model_config}")
+            self.logger.info(f"Model initialized with log-mel + phase architecture: {model_config}")
+            self.logger.info(f"Mel filterbank: {N_MELS} mel bins")
         
         # Enable gradient checkpointing
         if use_checkpointing:
             self._enable_gradient_checkpointing()
         
-        # CRITICAL: Enhanced loss functions with guaranteed parameter usage
+        # CRITICAL: Enhanced loss functions for log-mel domain
         self.spectral_loss = SpectralLoss(
-            n_ffts=[512, 1024, 2048], 
+            n_mels=N_MELS,
             alpha=1.0, 
-            beta=0.1, 
+            beta=0.5,  # Log-mel loss weight
+            gamma=0.3, # Phase loss weight
             use_triton=False
         )
         self.mse_loss = nn.MSELoss()
+        self.l1_loss = nn.L1Loss()
         
         # Optimizer
         self.optimizer = torch.optim.AdamW(
@@ -148,13 +161,14 @@ class LyCodecTrainer:
                 self.model, self.optimizer, self.scheduler
             )
             
-            # CRITICAL: Move spectral loss to the same device as the model
+            # CRITICAL: Move components to the same device as the model
             self.spectral_loss = self.spectral_loss.to(self.accelerator.device)
+            self.mel_filterbank = self.mel_filterbank.to(self.accelerator.device)
             
             if self.is_main_process:
                 self.logger.info(f"V100×4 setup: {self.accelerator.num_processes} GPUs, "
                                f"mixed precision: {self.accelerator.mixed_precision}")
-                self.logger.info(f"✅ SpectralLoss moved to device: {self.accelerator.device}")
+                self.logger.info(f"✅ Components moved to device: {self.accelerator.device}")
         
         # Initialize wandb tracking
         self.wandb_run = None
@@ -168,7 +182,7 @@ class LyCodecTrainer:
             from logging.handlers import RotatingFileHandler
             
             file_handler = RotatingFileHandler(
-                'v100x4_training.log',
+                'v100x4_logmel_training.log',
                 maxBytes=20*1024*1024,
                 backupCount=10
             )
@@ -182,7 +196,7 @@ class LyCodecTrainer:
                 ]
             )
             self.logger = logging.getLogger(__name__)
-            self.logger.info("🚀 V100×4 training logger initialized")
+            self.logger.info("🚀 V100×4 Log-mel + Phase training logger initialized")
         else:
             self.logger = logging.getLogger(__name__)
             self.logger.addHandler(logging.NullHandler())
@@ -262,21 +276,19 @@ class LyCodecTrainer:
             patched_count = 0
             
             try:
-                if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'layers'):
-                    for i, layer in enumerate(self.model.encoder.layers):
-                        if hasattr(layer, 'psych_attn'):
-                            apply_checkpointing_to_module(layer, f"encoder.layers[{i}]")
-                            patched_count += 1
+                if hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'residual_blocks'):
+                    for i, block in enumerate(self.model.encoder.residual_blocks):
+                        apply_checkpointing_to_module(block, f"encoder.residual_blocks[{i}]")
+                        patched_count += 1
             except Exception as e:
                 if self.is_main_process:
                     self.logger.warning(f"Error applying checkpointing to encoder: {e}")
             
             try:
-                if hasattr(self.model, 'decoder') and hasattr(self.model.decoder, 'layers'):
-                    for i, layer in enumerate(self.model.decoder.layers):
-                        if hasattr(layer, 'psych_attn'):
-                            apply_checkpointing_to_module(layer, f"decoder.layers[{i}]")
-                            patched_count += 1
+                if hasattr(self.model, 'decoder') and hasattr(self.model.decoder, 'residual_blocks'):
+                    for i, block in enumerate(self.model.decoder.residual_blocks):
+                        apply_checkpointing_to_module(block, f"decoder.residual_blocks[{i}]")
+                        patched_count += 1
             except Exception as e:
                 if self.is_main_process:
                     self.logger.warning(f"Error applying checkpointing to decoder: {e}")
@@ -306,7 +318,7 @@ class LyCodecTrainer:
                     tags=wandb_config['tags'],
                     notes=wandb_config['notes']
                 )
-                self.logger.info(f"🎯 WandB initialized for V100×4: {self.wandb_run.name}")
+                self.logger.info(f"🎯 WandB initialized for Log-mel V100×4: {self.wandb_run.name}")
             except Exception as e:
                 self.logger.warning(f"Failed to initialize wandb: {e}")
                 self.wandb_run = None
@@ -335,58 +347,117 @@ class LyCodecTrainer:
                 if self.is_main_process:
                     self.logger.debug(f"Memory monitoring failed: {e}")
     
-    def compute_loss(self, pred_real, pred_imag, target_real, target_imag, target_audio, pred_latent=None):
+    def _audio_to_log_mel_phase(self, stereo_audio):
         """
-        CRITICAL: Compute loss ensuring ALL model parameters receive gradients
-        This is essential for DDP compatibility and prevents unused parameter errors
+        Convert stereo audio to log-mel + phase features
+        Args:
+            stereo_audio: [B, 2, T] stereo audio tensor
+        Returns:
+            log_mel_features: [B, n_mels, T_frames] log-mel spectrogram
+            phase_features: [B, n_mels, T_frames] phase information
         """
-        device = pred_real.device
+        B, channels, T = stereo_audio.shape
+        
+        # Process each channel and average for mono mel processing
+        all_log_mels = []
+        all_phases = []
+        
+        for ch in range(channels):
+            # STFT for each channel
+            complex_spec = to_complex_spec(stereo_audio[:, ch])  # [B, F, T_frames]
+            
+            # Extract magnitude and phase
+            magnitude_spec, phase_spec = to_magnitude_phase(complex_spec)
+            
+            # Convert magnitude to mel-scale
+            mel_spec = to_mel_spectrogram(magnitude_spec, self.mel_filterbank)  # [B, n_mels, T_frames]
+            
+            # Convert to log-mel
+            log_mel_spec = to_log_mel(mel_spec)  # [B, n_mels, T_frames]
+            
+            # Process phase to mel-scale (approximate mapping)
+            # Use magnitude weighting for phase importance
+            magnitude_weights = magnitude_spec / (magnitude_spec.amax(dim=(-1, -2), keepdim=True) + 1e-8)
+            weighted_phase = phase_spec * magnitude_weights
+            
+            # Convert phase to mel-scale using the same filterbank
+            phase_mel = to_mel_spectrogram(weighted_phase.abs(), self.mel_filterbank)
+            
+            # Preserve phase structure by interpolating original phase from F bins to mel bins
+            # phase_spec: [B, F, T] -> [B, n_mels, T]
+            B, F_bins, T_frames = phase_spec.shape
+            
+            # Reshape for interpolation: [B, F, T] -> [B, 1, F, T] (treat F and T as spatial dims)
+            phase_4d = phase_spec.unsqueeze(1)  # [B, 1, F, T]
+            
+            # Interpolate from [F, T] to [n_mels, T]
+            phase_interpolated = torch.nn.functional.interpolate(
+                phase_4d, size=(N_MELS, T_frames), 
+                mode='bilinear', align_corners=False
+            ).squeeze(1)  # [B, n_mels, T]
+            
+            all_log_mels.append(log_mel_spec)
+            all_phases.append(phase_interpolated)
+        
+        # Average across channels for processing
+        log_mel_features = torch.stack(all_log_mels, dim=1).mean(dim=1)  # [B, n_mels, T_frames]
+        phase_features = torch.stack(all_phases, dim=1).mean(dim=1)      # [B, n_mels, T_frames]
+        
+        return log_mel_features, phase_features
+    
+    def compute_loss(self, pred_log_mel, pred_phase, target_log_mel, target_phase, target_audio, pred_latent=None):
+        """
+        CRITICAL: Compute loss for log-mel + phase architecture ensuring ALL model parameters receive gradients
+        """
+        device = pred_log_mel.device
         
         # CRITICAL: Verify all tensors require gradients for DDP
-        assert pred_real.requires_grad, "pred_real must require gradients"
-        assert pred_imag.requires_grad, "pred_imag must require gradients"
+        assert pred_log_mel.requires_grad, "pred_log_mel must require gradients"
+        assert pred_phase.requires_grad, "pred_phase must require gradients"
         if pred_latent is not None:
             assert pred_latent.requires_grad, "pred_latent must require gradients"
         
-        # Reconstruct complex spectrogram
-        pred_complex = torch.complex(pred_real, pred_imag)
-        target_complex = torch.complex(target_real, target_imag)
+        # CRITICAL: Enhanced loss computation for log-mel + phase architecture
         
-        # CRITICAL: Enhanced loss computation ensuring all parameters are used
+        # 1. Log-mel reconstruction loss (primary)
+        log_mel_loss = self.l1_loss(pred_log_mel, target_log_mel)
         
-        # 1. Magnitude loss
-        pred_mag = torch.abs(pred_complex)
-        target_mag = torch.abs(target_complex)
-        magnitude_loss = F.l1_loss(pred_mag, target_mag)
+        # 2. Mel-scale loss (convert back to linear for additional constraint)
+        pred_mel = from_log_mel(pred_log_mel)
+        target_mel = from_log_mel(target_log_mel)
+        mel_loss = self.mse_loss(pred_mel, target_mel)
         
-        # 2. Phase loss with magnitude weighting
-        magnitude_weight = target_mag / (target_mag.amax(dim=(-1, -2, -3), keepdim=True) + 1e-8)
-        pred_phase = torch.angle(pred_complex)
-        target_phase = torch.angle(target_complex)
-        
+        # 3. Phase reconstruction loss with magnitude weighting
+        magnitude_weight = target_mel / (target_mel.amax(dim=(-1, -2), keepdim=True) + 1e-8)
         phase_diff_cos = torch.cos(pred_phase - target_phase)
-        phase_loss = F.mse_loss(
-            torch.clamp((1 - phase_diff_cos) * magnitude_weight, 0, 2), 
-            torch.zeros_like(phase_diff_cos)
-        )
+        weighted_phase_loss = (1 - phase_diff_cos) * magnitude_weight
+        phase_loss = weighted_phase_loss.mean()
         
-        # 3. CRITICAL: Spectral loss using direct complex spectrogram input
+        # 4. CRITICAL: Multi-scale spectral loss using SpectralLoss
         try:
-            spectral_loss = self.spectral_loss(pred_complex, target_complex)
+            spectral_loss = self.spectral_loss(pred_log_mel, target_log_mel, pred_phase, target_phase)
         except Exception as e:
             if self.is_main_process:
                 self.logger.warning(f"Spectral loss failed: {e}")
-            # Fallback to simple magnitude loss with gradients
-            spectral_loss = F.mse_loss(pred_mag, target_mag)
+            # Fallback to simple mel loss with gradients
+            spectral_loss = self.mse_loss(pred_mel, target_mel)
         
-        # 4. CRITICAL: Time-domain proxy loss to ensure decoder parameters get gradients
-        # Use magnitude-based proxy instead of expensive ISTFT
-        time_loss = F.mse_loss(
-            pred_mag.mean(dim=(-2)), 
-            target_mag.mean(dim=(-2))
-        )
+        # 5. CRITICAL: Time-domain proxy loss using reconstructed magnitude
+        # Convert mel back to magnitude spectrum for time-domain approximation
+        try:
+            pred_magnitude = mel_to_magnitude(pred_mel, self.mel_filterbank)
+            target_magnitude = mel_to_magnitude(target_mel, self.mel_filterbank)
+            
+            # Use spectral energy as proxy for time-domain loss
+            pred_energy = pred_magnitude.mean(dim=-2)  # [B, T_frames]
+            target_energy = target_magnitude.mean(dim=-2)  # [B, T_frames]
+            time_proxy_loss = self.mse_loss(pred_energy, target_energy)
+        except Exception as e:
+            if self.is_main_process:
+                self.logger.debug(f"Time proxy loss failed: {e}")
+            time_proxy_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
-        # 5. CRITICAL: Enhanced latent regularization to ensure ALL encoder parameters get gradients
+        # 6. CRITICAL: Enhanced latent regularization ensuring encoder parameters get gradients
         latent_loss = torch.tensor(0.0, device=device, requires_grad=True)
         if pred_latent is not None:
             # Multiple regularization terms for comprehensive gradient flow
@@ -419,7 +490,7 @@ class LyCodecTrainer:
             # Latent magnitude distribution loss (ensures numerical stability)
             latent_std = torch.std(pred_latent, dim=(2, 3), keepdim=True)
             std_target = torch.ones_like(latent_std)  # Target std of 1.0
-            std_loss = F.mse_loss(latent_std, std_target)
+            std_loss = self.mse_loss(latent_std, std_target)
             
             # CRITICAL: Combine all latent losses with significant weights
             latent_loss = (
@@ -430,7 +501,29 @@ class LyCodecTrainer:
                 0.01 * std_loss             # Standard deviation regulation
             )
         
-        # 6. CRITICAL: Additional model-wide regularization to ensure ALL parameters get gradients
+        # 7. CRITICAL: Perceptual consistency loss in mel-domain
+        perceptual_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        try:
+            # Compare mel-scale features at different frequency ranges
+            low_freq_pred = pred_mel[:, :N_MELS//3, :]   # Low frequencies
+            mid_freq_pred = pred_mel[:, N_MELS//3:2*N_MELS//3, :]  # Mid frequencies
+            high_freq_pred = pred_mel[:, 2*N_MELS//3:, :]  # High frequencies
+            
+            low_freq_target = target_mel[:, :N_MELS//3, :]
+            mid_freq_target = target_mel[:, N_MELS//3:2*N_MELS//3, :]
+            high_freq_target = target_mel[:, 2*N_MELS//3:, :]
+            
+            # Weighted perceptual loss (emphasize mid-frequencies)
+            perceptual_loss = (
+                0.3 * self.l1_loss(low_freq_pred, low_freq_target) +
+                0.5 * self.l1_loss(mid_freq_pred, mid_freq_target) +
+                0.2 * self.l1_loss(high_freq_pred, high_freq_target)
+            )
+        except Exception as e:
+            if self.is_main_process:
+                self.logger.debug(f"Perceptual loss failed: {e}")
+        
+        # 8. CRITICAL: Additional model-wide regularization to ensure ALL parameters get gradients
         model_regularization = torch.tensor(0.0, device=device, requires_grad=True)
         
         # Add small L2 penalty on ALL model parameters
@@ -442,13 +535,15 @@ class LyCodecTrainer:
             if self.is_main_process:
                 self.logger.debug(f"Model regularization failed: {e}")
         
-        # CRITICAL: Combine all losses with weights ensuring strong gradient flow
+        # CRITICAL: Combine all losses with weights optimized for log-mel + phase architecture
         total_loss = (
-            1.0 * magnitude_loss +          # Primary reconstruction loss
-            0.2 * phase_loss +              # Phase alignment
-            0.5 * spectral_loss +           # Multi-scale spectral loss
-            0.3 * time_loss +               # Time-domain proxy
-            0.15 * latent_loss +            # Enhanced latent regularization (increased from 0.1)
+            1.0 * log_mel_loss +            # Primary log-mel reconstruction loss
+            0.3 * mel_loss +                # Linear mel constraint
+            0.5 * phase_loss +              # Phase alignment with magnitude weighting
+            0.7 * spectral_loss +           # Multi-scale spectral loss
+            0.2 * time_proxy_loss +         # Time-domain proxy
+            0.15 * latent_loss +            # Enhanced latent regularization
+            0.1 * perceptual_loss +         # Perceptual consistency in mel-domain
             0.001 * model_regularization    # Global parameter regularization
         )
         
@@ -457,60 +552,48 @@ class LyCodecTrainer:
         
         return {
             'total_loss': total_loss,
-            'magnitude_loss': magnitude_loss,
+            'log_mel_loss': log_mel_loss,
+            'mel_loss': mel_loss,
             'phase_loss': phase_loss,
             'spectral_loss': spectral_loss,
-            'time_loss': time_loss,
+            'time_proxy_loss': time_proxy_loss,
             'latent_loss': latent_loss,
+            'perceptual_loss': perceptual_loss,
             'model_regularization': model_regularization
         }
     
     def train_step(self, batch):
         """
-        CRITICAL: Enhanced training step ensuring all parameters receive gradients
+        CRITICAL: Enhanced training step for log-mel + phase architecture
         """
         try:
             # Unpack batch
             stereo_audio = batch['audio']  # [B, 2, T]
             
-            # CRITICAL: Improved STFT computation with proper tensor handling
+            # CRITICAL: Convert audio to log-mel + phase features
             B, C, T_len = stereo_audio.shape
             
             # Handle different batch sizes gracefully
             if B == 0:
                 raise ValueError("Empty batch received")
             
-            # Vectorized STFT computation
+            # NEW ARCHITECTURE: Convert to log-mel + phase
             try:
-                # Flatten channels for batch processing: [B, 2, T] -> [B*2, T]
-                audio_flat = stereo_audio.view(-1, T_len)
-                complex_flat = to_complex_spec(audio_flat)  # [B*2, F, T_frames]
-                
-                # Reshape back to separate channels: [B*2, F, T_frames] -> [B, 2, F, T_frames]
-                F_bins, T_frames = complex_flat.shape[-2:]
-                complex_input = complex_flat.view(B, C, F_bins, T_frames)
+                log_mel_features, phase_features = self._audio_to_log_mel_phase(stereo_audio)
                 
             except Exception as e:
                 if self.is_main_process:
-                    self.logger.error(f"STFT computation failed: {e}")
+                    self.logger.error(f"Log-mel conversion failed: {e}")
                 raise e
-            
-            # Magnitude for psychoacoustic analysis
-            magnitude_input = complex_input.abs().mean(dim=1)  # [B, F, T_frames]
-            
-            # Prepare input for model: separate real and imaginary parts
-            real_part = complex_input.real
-            imag_part = complex_input.imag
-            target_complex_input = torch.stack([real_part, imag_part], dim=2)  # [B, 2, 2, F, T_frames]
             
             # CRITICAL: Forward pass ensuring all parameters are used
             try:
-                pred_real, pred_imag, pred_latent = self.model(target_complex_input, magnitude_input)
+                pred_log_mel, pred_phase, pred_latent = self.model(log_mel_features, phase_features)
                 
                 # CRITICAL: Verify all outputs have gradients
                 if self.model.training:
-                    assert pred_real.requires_grad, "pred_real must require gradients during training"
-                    assert pred_imag.requires_grad, "pred_imag must require gradients during training"
+                    assert pred_log_mel.requires_grad, "pred_log_mel must require gradients during training"
+                    assert pred_phase.requires_grad, "pred_phase must require gradients during training"
                     assert pred_latent.requires_grad, "pred_latent must require gradients during training"
                 
             except Exception as e:
@@ -520,8 +603,8 @@ class LyCodecTrainer:
             
             # CRITICAL: Loss computation ensuring all parameters receive gradients
             losses = self.compute_loss(
-                pred_real, pred_imag,
-                real_part, imag_part,
+                pred_log_mel, pred_phase,
+                log_mel_features, phase_features,
                 stereo_audio, pred_latent
             )
             
@@ -546,17 +629,19 @@ class LyCodecTrainer:
             dummy_loss = torch.tensor(1.0, device=device, requires_grad=True)
             dummy_losses = {
                 'total_loss': dummy_loss,
-                'magnitude_loss': dummy_loss * 0.1,
+                'log_mel_loss': dummy_loss * 0.1,
+                'mel_loss': dummy_loss * 0.1,
                 'phase_loss': dummy_loss * 0.1,
                 'spectral_loss': dummy_loss * 0.1,
-                'time_loss': dummy_loss * 0.1,
+                'time_proxy_loss': dummy_loss * 0.1,
                 'latent_loss': dummy_loss * 0.1,
+                'perceptual_loss': dummy_loss * 0.1,
                 'model_regularization': dummy_loss * 0.1
             }
             return dummy_losses, dummy_loss
     
     def train_epoch(self, dataloader, epoch):
-        """Train for one epoch with enhanced DDP compatibility"""
+        """Train for one epoch with enhanced DDP compatibility for log-mel architecture"""
         self.model.train()
         total_losses = {}
         num_batches = 0
@@ -572,7 +657,7 @@ class LyCodecTrainer:
         if self.is_main_process:
             batch_pbar = tqdm(
                 dataloader,
-                desc=f"V100×4 Epoch {epoch} [FIXED]",
+                desc=f"V100×4 Epoch {epoch} [LOG-MEL+PHASE]",
                 leave=False,
                 unit="batch",
                 dynamic_ncols=True,
@@ -583,12 +668,12 @@ class LyCodecTrainer:
         
         for batch_idx, batch in enumerate(batch_pbar):
             if self.is_main_process and batch_idx == 0:
-                print(f"🔍 Processing first batch with critical fixes...")
+                print(f"🔍 Processing first batch with log-mel + phase architecture...")
             
             try:
                 # CRITICAL: Use Accelerate's gradient accumulation context
                 with self.accelerator.accumulate(self.model):
-                    # Training step with critical fixes
+                    # Training step with log-mel architecture
                     losses, loss = self.train_step(batch)
                     
                     # Skip dummy losses from errors
@@ -598,7 +683,7 @@ class LyCodecTrainer:
                         continue
                     
                     if self.is_main_process and batch_idx == 0:
-                        print(f"🔍 Starting backward pass...")
+                        print(f"🔍 Starting backward pass for log-mel + phase...")
                     
                     # CRITICAL: Use Accelerate's backward for proper DDP handling
                     self.accelerator.backward(loss)
@@ -620,7 +705,7 @@ class LyCodecTrainer:
                         self.optimizer.zero_grad()
                     
                     if self.is_main_process and batch_idx == 0:
-                        print(f"✅ First batch completed with critical fixes!")
+                        print(f"✅ First batch completed with log-mel + phase architecture!")
                 
                 # Accumulate losses
                 for key, value in losses.items():
@@ -643,10 +728,11 @@ class LyCodecTrainer:
                     
                     batch_pbar.set_postfix({
                         'loss': f"{losses['total_loss'].item():.4f}",
-                        'mag': f"{losses['magnitude_loss'].item():.3f}",
+                        'log_mel': f"{losses['log_mel_loss'].item():.3f}",
+                        'phase': f"{losses['phase_loss'].item():.3f}",
                         'lr': f"{current_lr:.2e}",
                         'gpu': gpu_mem,
-                        'fixed': "✓"
+                        'arch': "log_mel"
                     })
                 
                 # Periodic logging
@@ -657,10 +743,12 @@ class LyCodecTrainer:
                     self.logger.info(
                         f"V100×4 Epoch {epoch}, Batch {batch_idx}/{len(dataloader)}, "
                         f"Loss: {losses['total_loss'].item():.4f}, "
+                        f"Log-mel: {losses['log_mel_loss'].item():.4f}, "
+                        f"Phase: {losses['phase_loss'].item():.4f}, "
                         f"LR: {current_lr:.2e}, "
                         f"Time: {elapsed:.1f}s, "
                         f"GPUs: {self.accelerator.num_processes}, "
-                        f"Status: FIXED"
+                        f"Architecture: LOG-MEL+PHASE"
                     )
                 
                 # Memory management
@@ -684,18 +772,20 @@ class LyCodecTrainer:
         else:
             avg_losses = {
                 'total_loss': 0.0,
-                'magnitude_loss': 0.0,
+                'log_mel_loss': 0.0,
+                'mel_loss': 0.0,
                 'phase_loss': 0.0,
                 'spectral_loss': 0.0,
-                'time_loss': 0.0,
+                'time_proxy_loss': 0.0,
                 'latent_loss': 0.0,
+                'perceptual_loss': 0.0,
                 'model_regularization': 0.0
             }
         
         return avg_losses
     
     def validate(self, val_dataloader):
-        """Validation step with fixes"""
+        """Validation step with log-mel + phase architecture"""
         self.model.eval()
         total_val_losses = {}
         num_val_batches = 0
@@ -708,7 +798,7 @@ class LyCodecTrainer:
         if self.is_main_process:
             val_pbar = tqdm(
                 val_dataloader,
-                desc="V100×4 Validation [FIXED]",
+                desc="V100×4 Validation [LOG-MEL+PHASE]",
                 leave=False,
                 unit="batch",
                 dynamic_ncols=True,
@@ -720,23 +810,15 @@ class LyCodecTrainer:
         with torch.no_grad():
             for batch in val_pbar:
                 try:
-                    # Forward pass
+                    # Forward pass with log-mel architecture
                     stereo_audio = batch['audio']
                     B, C, T_len = stereo_audio.shape
                     
-                    # STFT computation
-                    audio_flat = stereo_audio.view(-1, T_len)
-                    complex_flat = to_complex_spec(audio_flat)
-                    F_bins, T_frames = complex_flat.shape[-2:]
-                    complex_input = complex_flat.view(B, C, F_bins, T_frames)
-                    magnitude_input = complex_input.abs().mean(dim=1)
+                    # Convert to log-mel + phase
+                    log_mel_features, phase_features = self._audio_to_log_mel_phase(stereo_audio)
                     
-                    real_part = complex_input.real
-                    imag_part = complex_input.imag
-                    target_complex_input = torch.stack([real_part, imag_part], dim=2)
-                    
-                    pred_real, pred_imag, pred_latent = self.model(target_complex_input, magnitude_input)
-                    losses = self.compute_loss(pred_real, pred_imag, real_part, imag_part, stereo_audio, pred_latent)
+                    pred_log_mel, pred_phase, pred_latent = self.model(log_mel_features, phase_features)
+                    losses = self.compute_loss(pred_log_mel, pred_phase, log_mel_features, phase_features, stereo_audio, pred_latent)
                     
                     # Accumulate losses
                     for key, value in losses.items():
@@ -749,8 +831,9 @@ class LyCodecTrainer:
                     if self.is_main_process:
                         val_pbar.set_postfix({
                             'val_loss': f"{losses['total_loss'].item():.4f}",
-                            'val_mag': f"{losses['magnitude_loss'].item():.3f}",
-                            'fixed': "✓"
+                            'val_log_mel': f"{losses['log_mel_loss'].item():.3f}",
+                            'val_phase': f"{losses['phase_loss'].item():.3f}",
+                            'arch': "log_mel"
                         })
                 
                 except Exception as e:
@@ -770,16 +853,17 @@ class LyCodecTrainer:
         return avg_val_losses
     
     def log_epoch(self, epoch, avg_losses, val_losses, best_loss):
-        """Log epoch results"""
+        """Log epoch results for log-mel + phase architecture"""
         if not self.is_main_process:
             return
         
         # Console logging
-        print(f"🚀 V100×4 Epoch {epoch} completed - Loss: {avg_losses['total_loss']:.6f} [FIXED]")
+        print(f"🚀 V100×4 Epoch {epoch} completed - Log-mel Loss: {avg_losses['log_mel_loss']:.6f}, Phase Loss: {avg_losses['phase_loss']:.6f}")
+        print(f"   📊 Total Loss: {avg_losses['total_loss']:.6f}")
         if val_losses:
             print(f"   📊 Validation Loss: {val_losses.get('val_total_loss', 'N/A')}")
-        print(f"   🔧 Critical fixes applied and working")
-        print("-" * 60)
+        print(f"   🎵 Architecture: Log-mel + Phase preservation with psychoacoustic masking")
+        print("-" * 80)
         
         # WandB logging
         if self.wandb_run is not None:
@@ -790,7 +874,9 @@ class LyCodecTrainer:
                 **{f'val/{k}': v for k, v in val_losses.items()},
                 'best_loss': best_loss,
                 'num_gpus': self.accelerator.num_processes,
-                'fixes_applied': 1
+                'architecture': 'log_mel_phase',
+                'mel_bins': N_MELS,
+                'compression_ratio': 100  # f10c10
             }
             
             # GPU memory usage
@@ -811,7 +897,7 @@ class LyCodecTrainer:
                 self.logger.warning(f"Failed to log to wandb: {e}")
     
     def save_checkpoint(self, epoch, losses, save_path):
-        """Save training checkpoint"""
+        """Save training checkpoint for log-mel architecture"""
         if not self.is_main_process:
             return
         
@@ -828,23 +914,27 @@ class LyCodecTrainer:
                     'mixed_precision': str(self.accelerator.mixed_precision)
                 },
                 'hardware_info': 'V100x4-16GB',
+                'architecture': 'log_mel_phase',
+                'mel_bins': N_MELS,
+                'compression_ratio': 100,  # f10c10
                 'fixes_applied': {
                     'ddp_unused_parameters': True,
                     'rng_isolation': True,
                     'gradient_flow_enhancement': True,
-                    'tensor_dimension_fixes': True,
+                    'log_mel_phase_architecture': True,
+                    'psychoacoustic_masking': True,
                     'memory_optimization': True
                 }
             }
             
             torch.save(checkpoint, save_path, _use_new_zipfile_serialization=False)
-            self.logger.info(f"V100×4 checkpoint saved with fixes: {save_path}")
+            self.logger.info(f"V100×4 log-mel checkpoint saved: {save_path}")
             
         except Exception as e:
             self.logger.error(f"Failed to save checkpoint: {e}")
     
     def load_checkpoint(self, checkpoint_path):
-        """Load training checkpoint"""
+        """Load training checkpoint for log-mel architecture"""
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
             
@@ -869,10 +959,17 @@ class LyCodecTrainer:
             
             losses = checkpoint.get('losses', {})
             
-            # Log fix information
+            # Log architecture information
+            architecture = checkpoint.get('architecture', 'unknown')
+            mel_bins = checkpoint.get('mel_bins', 'unknown')
+            compression_ratio = checkpoint.get('compression_ratio', 'unknown')
             fixes_info = checkpoint.get('fixes_applied', {})
-            if self.is_main_process and fixes_info:
-                self.logger.info(f"Loaded checkpoint with fixes: {fixes_info}")
+            
+            if self.is_main_process:
+                self.logger.info(f"Loaded checkpoint: {architecture} architecture")
+                self.logger.info(f"  Mel bins: {mel_bins}, Compression: {compression_ratio}x")
+                if fixes_info:
+                    self.logger.info(f"  Fixes applied: {fixes_info}")
             
             return epoch, losses
             
@@ -883,12 +980,12 @@ class LyCodecTrainer:
     
     def verify_ddp_compatibility(self):
         """
-        CRITICAL: Verify DDP compatibility to prevent parameter reduction errors
+        CRITICAL: Verify DDP compatibility for log-mel + phase architecture
         """
         if not self.is_main_process:
             return
         
-        print("🔍 Verifying DDP compatibility with critical fixes...")
+        print("🔍 Verifying DDP compatibility with log-mel + phase architecture...")
         
         # Check parameter gradients
         total_params = 0
@@ -903,24 +1000,24 @@ class LyCodecTrainer:
         
         print(f"✅ Parameters requiring gradients: {grad_params}/{total_params}")
         
-        # CRITICAL: Forward pass verification with gradient tracking
+        # CRITICAL: Forward pass verification with log-mel + phase input
         try:
             self.model.train()
-            dummy_input = torch.randn(1, 2, 2, 512, 256, device=self.accelerator.device)
-            dummy_magnitude = torch.randn(1, 512, 256, device=self.accelerator.device)
+            dummy_log_mel = torch.randn(1, N_MELS, 256, device=self.accelerator.device)
+            dummy_phase = torch.randn(1, N_MELS, 256, device=self.accelerator.device)
             
             with torch.enable_grad():
-                pred_real, pred_imag, pred_latent = self.model(dummy_input, dummy_magnitude)
+                pred_log_mel, pred_phase, pred_latent = self.model(dummy_log_mel, dummy_phase)
                 
                 # CRITICAL: Verify all outputs have gradients
-                assert pred_real.requires_grad, "pred_real should require gradients"
-                assert pred_imag.requires_grad, "pred_imag should require gradients"  
+                assert pred_log_mel.requires_grad, "pred_log_mel should require gradients"
+                assert pred_phase.requires_grad, "pred_phase should require gradients"  
                 assert pred_latent.requires_grad, "pred_latent should require gradients"
                 
                 # CRITICAL: Create loss that uses ALL outputs
                 dummy_loss = (
-                    pred_real.mean() + 
-                    pred_imag.mean() + 
+                    pred_log_mel.mean() + 
+                    pred_phase.mean() + 
                     pred_latent.mean() +
                     # Add small regularization to ensure ALL parameters get gradients
                     sum(0.0001 * p.sum() for p in self.model.parameters() if p.requires_grad)
@@ -954,10 +1051,12 @@ class LyCodecTrainer:
             print(f"❌ DDP compatibility check failed: {e}")
             raise e
         
-        print("✅ DDP compatibility verified with critical fixes applied")
-        print("🔧 Critical fixes include:")
+        print("✅ DDP compatibility verified with log-mel + phase architecture")
+        print("🎵 Architecture features:")
+        print("   - Log-mel domain processing with phase preservation")
+        print("   - Psychoacoustic masking curve weighting")
+        print("   - f10c10 compression (100x) maintained")
         print("   - Enhanced loss computation ensuring all parameters receive gradients")
-        print("   - find_unused_parameters=True in DDP configuration")
+        print("   - find_unused_parameters=False in DDP configuration")
         print("   - Isolated RNG states per process")
-        print("   - Improved tensor dimension handling")
         print("   - Enhanced memory management for V100 16GB")

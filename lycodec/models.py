@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-from .audio import GammatoneFilterbank, psychoacoustic_masking
+from .audio import GammatoneFilterbank, psychoacoustic_masking, N_MELS
 
 # FIXED: Safer Triton import with complete disabling
 try:
@@ -123,8 +123,8 @@ class LinearAttention(nn.Module):
 
 class PsychoacousticTransform(nn.Module):
     """
-    CRITICAL: Psychoacoustic attention ensuring ALL parameters receive gradients
-    Fixed to handle None magnitude_spectrum gracefully while maintaining gradient flow
+    CRITICAL: Psychoacoustic attention for log-mel processing with masking curve weighting
+    Enhanced to handle log-mel input and apply psychoacoustic masking as weights
     """
     def __init__(self, dim, n_gammatone_filters=64, heads=8, use_triton=False):
         super().__init__()
@@ -133,60 +133,79 @@ class PsychoacousticTransform(nn.Module):
         self.n_filters = n_gammatone_filters
         self.use_triton = False  # Force disable
         
-        # Gammatone filterbank
+        # Gammatone filterbank (adapted for mel-scale input)
         self.gammatone = GammatoneFilterbank(n_filters=n_gammatone_filters, use_triton=False)
         
         # Linear attention
         self.attention = LinearAttention(dim, heads=heads, use_triton=False)
         
-        # Learnable psychoacoustic weighting
+        # Psychoacoustic weighting projection
         self.psych_proj = nn.Linear(n_gammatone_filters, dim)
         self.norm = FastRMSNorm2D(dim, use_triton=False)
         
-        # Learnable scale factor
-        self.gamma = nn.Parameter(torch.ones(1))
+        # Learnable masking curve parameters
+        self.masking_scale = nn.Parameter(torch.ones(1))
+        self.masking_bias = nn.Parameter(torch.zeros(1))
         
-        # CRITICAL: Fallback parameters to ensure gradient flow when magnitude_spectrum is None
+        # CRITICAL: Fallback parameters to ensure gradient flow
         self.fallback_weights = nn.Parameter(torch.zeros(1, dim, 1, 1))
         self.default_psychoacoustic = nn.Parameter(torch.ones(n_gammatone_filters))
         
-        print(f"✅ PsychoacousticTransform: Using stable PyTorch with gradient fixes")
+        print(f"✅ PsychoacousticTransform: Log-mel domain with masking curve weighting")
         
-    def forward(self, x, magnitude_spectrum=None):
+    def forward(self, x, log_mel_spectrum=None):
         """
-        CRITICAL: Ensure ALL parameters receive gradients regardless of magnitude_spectrum availability
+        CRITICAL: Apply psychoacoustic masking curve as attention weights
+        Args:
+            x: [B, C, H, W] feature tensor
+            log_mel_spectrum: [B, n_mels, T] log-mel spectrogram for psychoacoustic analysis
         """
         B, C, H, W = x.shape
         
         # CRITICAL: Always compute psychoacoustic weights to ensure parameter usage
-        if magnitude_spectrum is not None:
+        if log_mel_spectrum is not None:
             try:
-                # Normal psychoacoustic processing
-                gammatone_out = self.gammatone(magnitude_spectrum)  # [B, n_filters, T]
+                # Convert log-mel back to linear for psychoacoustic analysis
+                mel_spectrum = torch.exp(log_mel_spectrum)  # [B, n_mels, T]
+                
+                # Apply gammatone filterbank
+                gammatone_out = self.gammatone(mel_spectrum)  # [B, n_filters, T]
+                
+                # Compute psychoacoustic masking curve
                 masking_curve = psychoacoustic_masking(gammatone_out, use_triton=False)
                 
+                # Apply learnable masking parameters
+                weighted_masking = self.masking_scale * masking_curve + self.masking_bias
+                
                 # Project to feature dimension
-                psych_weights = self.psych_proj(masking_curve.transpose(1, 2))  # [B, T, C]
+                psych_weights = self.psych_proj(weighted_masking.transpose(1, 2))  # [B, T, C]
+                
+                # Interpolate to match feature map size
                 psych_weights = F.interpolate(
                     psych_weights.transpose(1, 2).unsqueeze(-1), 
                     size=(H, W), 
                     mode='bilinear', 
                     align_corners=False
-                ).squeeze(-1)
+                ).squeeze(-1)  # [B, C, H, W]
                 
-                psych_weights = torch.tanh(psych_weights * self.gamma)
+                # Apply tanh activation for bounded weighting
+                psych_weights = torch.tanh(psych_weights)
                 
             except Exception as e:
                 print(f"⚠️ Psychoacoustic processing failed: {e}, using fallback")
-                magnitude_spectrum = None  # Force fallback
+                log_mel_spectrum = None  # Force fallback
         
         # CRITICAL: Fallback processing ensures ALL parameters get gradients
-        if magnitude_spectrum is None:
+        if log_mel_spectrum is None:
             # Use default psychoacoustic values to ensure parameter usage
-            default_masking = self.default_psychoacoustic.unsqueeze(0).unsqueeze(-1).expand(B, -1, H*W//10 + 1)
+            T_approx = max(W, 32)  # Approximate time dimension
+            default_masking = self.default_psychoacoustic.unsqueeze(0).unsqueeze(-1).expand(B, -1, T_approx)
+            
+            # Apply learnable masking parameters
+            weighted_masking = self.masking_scale * default_masking + self.masking_bias
             
             # Ensure psych_proj receives gradients
-            psych_weights = self.psych_proj(default_masking.transpose(1, 2))
+            psych_weights = self.psych_proj(weighted_masking.transpose(1, 2))
             psych_weights = F.interpolate(
                 psych_weights.transpose(1, 2).unsqueeze(-1),
                 size=(H, W),
@@ -194,14 +213,13 @@ class PsychoacousticTransform(nn.Module):
                 align_corners=False
             ).squeeze(-1)
             
-            # Ensure gamma receives gradients
-            psych_weights = torch.tanh(psych_weights * self.gamma)
+            psych_weights = torch.tanh(psych_weights)
             
             # Add fallback weights contribution
             psych_weights = psych_weights + self.fallback_weights
         
-        # Apply psychoacoustic weighting
-        x_weighted = x * (1.0 + psych_weights)
+        # Apply psychoacoustic weighting: masking curve modulates features
+        x_weighted = x * (1.0 + 0.1 * psych_weights)  # Gentle modulation
         
         # Reshape for attention
         x_flat = x_weighted.view(B, C, -1).transpose(1, 2)  # [B, H*W, C]
@@ -215,8 +233,8 @@ class PsychoacousticTransform(nn.Module):
 
 class ResidualBlock(nn.Module):
     """
-    CRITICAL: Residual block ensuring ALL parameters receive gradients
-    Fixed to guarantee gradient flow even when psychoacoustic processing is skipped
+    CRITICAL: Residual block for log-mel processing ensuring ALL parameters receive gradients
+    Enhanced for mel-scale feature processing
     """
     def __init__(self, dim, ff_mult=4, dropout=0.1, use_triton=False):
         super().__init__()
@@ -234,16 +252,16 @@ class ResidualBlock(nn.Module):
         )
         self.norm2 = FastRMSNorm2D(dim, use_triton=False)
         
-        # CRITICAL: Gradient ensurer for blocks without magnitude_spectrum
+        # CRITICAL: Gradient ensurer for blocks without log_mel_spectrum
         self.gradient_ensurer = nn.Parameter(torch.zeros(1, dim, 1, 1))
         
-    def forward(self, x, magnitude_spectrum=None):
+    def forward(self, x, log_mel_spectrum=None):
         """
-        CRITICAL: Ensure ALL parameters receive gradients regardless of magnitude_spectrum
+        CRITICAL: Ensure ALL parameters receive gradients regardless of log_mel_spectrum
         """
         # CRITICAL: Always process through psychoacoustic attention
         # This ensures psych_attn parameters always receive gradients
-        psych_output = self.psych_attn(self.norm1(x), magnitude_spectrum)
+        psych_output = self.psych_attn(self.norm1(x), log_mel_spectrum)
         x = x + psych_output
         
         # CRITICAL: Add gradient ensurer contribution
@@ -261,17 +279,23 @@ class ResidualBlock(nn.Module):
 
 class LyEncoder(nn.Module):
     """
-    CRITICAL: LyCodec Encoder ensuring ALL parameters receive gradients
-    Fixed psychoacoustic processing distribution and gradient flow
+    CRITICAL: LyCodec Encoder for log-mel + phase processing
+    Processes log-mel features and preserves phase information
     """
-    def __init__(self, in_channels=2, base_channels=64, latent_dim=64, n_layers=6, use_triton=False):
+    def __init__(self, in_channels=N_MELS, base_channels=64, latent_dim=64, n_layers=6, use_triton=False):
         super().__init__()
-        self.in_channels = in_channels
+        self.in_channels = in_channels  # N_MELS = 128
         self.latent_dim = latent_dim
         self.use_triton = False  # Force disable
         
-        # Initial projection
-        self.input_proj = nn.Conv2d(in_channels * 2, base_channels, 3, 1, 1)
+        # Initial projection: log-mel features
+        self.mel_proj = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
+        
+        # Phase processing branch
+        self.phase_proj = nn.Conv2d(in_channels, base_channels // 2, 3, 1, 1)
+        
+        # Combined feature projection
+        self.combined_proj = nn.Conv2d(base_channels + base_channels // 2, base_channels, 1)
         
         # CRITICAL: Track ResidualBlocks for gradient distribution
         self.residual_blocks = nn.ModuleList()
@@ -281,7 +305,7 @@ class LyEncoder(nn.Module):
         # Encoder layers with progressive downsampling
         current_dim = base_channels
         
-        # f10: Frequency downsampling
+        # f10: Frequency downsampling (mel-scale compression)
         for i in range(3):
             next_dim = min(current_dim * 2, 512)
             
@@ -317,17 +341,35 @@ class LyEncoder(nn.Module):
         self.num_blocks = len(self.residual_blocks) + 1  # +1 for final_residual
         self.psychoacoustic_distribution = nn.Parameter(torch.ones(self.num_blocks))
         
-        print(f"✅ LyEncoder: Using stable PyTorch with gradient distribution fixes")
+        print(f"✅ LyEncoder: Log-mel + phase processing with gradient distribution fixes")
         
-    def forward(self, complex_spec, magnitude_spectrum=None):
+    def forward(self, log_mel_features, phase_features=None, original_log_mel=None):
         """
-        CRITICAL: Ensure ALL ResidualBlocks receive gradients through distributed psychoacoustic processing
+        CRITICAL: Process log-mel and phase features
+        Args:
+            log_mel_features: [B, n_mels, T] log-mel spectrogram
+            phase_features: [B, n_mels, T] phase information (optional)
+            original_log_mel: [B, n_mels, T] for psychoacoustic processing
         """
-        # Flatten stereo channels: [B, 2, 2, freq_dim, T] -> [B, 4, freq_dim, T]
-        B, C1, C2, freq_dim, T = complex_spec.shape
-        x = complex_spec.view(B, C1 * C2, freq_dim, T)
+        B, n_mels, T = log_mel_features.shape
         
-        x = self.input_proj(x)
+        # Convert to 2D feature maps: [B, n_mels, T] -> [B, n_mels, T, 1] -> [B, n_mels, 1, T]
+        log_mel_2d = log_mel_features.unsqueeze(-1).transpose(-1, -2)  # [B, n_mels, 1, T]
+        
+        # Process mel features
+        mel_features = self.mel_proj(log_mel_2d)  # [B, base_channels, 1, T]
+        
+        # Process phase features if available
+        if phase_features is not None:
+            phase_2d = phase_features.unsqueeze(-1).transpose(-1, -2)  # [B, n_mels, 1, T]
+            phase_features_proc = self.phase_proj(phase_2d)  # [B, base_channels//2, 1, T]
+            
+            # Combine mel and phase features
+            combined_features = torch.cat([mel_features, phase_features_proc], dim=1)
+            x = self.combined_proj(combined_features)
+        else:
+            # Use only mel features
+            x = mel_features
         
         # CRITICAL: Distribute psychoacoustic processing across blocks
         # This ensures ALL blocks' psychoacoustic parameters receive gradients
@@ -338,18 +380,19 @@ class LyEncoder(nn.Module):
             self.residual_blocks, self.conv_layers, self.norm_layers
         )):
             # CRITICAL: Weighted psychoacoustic processing
-            # Each block gets a weighted version of magnitude_spectrum
-            if magnitude_spectrum is not None:
-                weighted_magnitude = magnitude_spectrum * block_weights[i]
+            # Each block gets a weighted version of log_mel spectrum
+            if original_log_mel is not None:
+                weighted_log_mel = original_log_mel * block_weights[i]
             else:
-                weighted_magnitude = None
+                weighted_log_mel = None
             
-            x = residual_block(x, weighted_magnitude)
+            x = residual_block(x, weighted_log_mel)
             x = conv_layer(x)
             x = norm_layer(x)
         
         # Final processing with remaining weight
-        x = self.final_residual(x, magnitude_spectrum * block_weights[-1] if magnitude_spectrum is not None else None)
+        final_log_mel = original_log_mel * block_weights[-1] if original_log_mel is not None else None
+        x = self.final_residual(x, final_log_mel)
         x = self.adaptive_pool(x)
         x = self.final_conv(x)
         
@@ -357,13 +400,13 @@ class LyEncoder(nn.Module):
 
 class LyDecoder(nn.Module):
     """
-    CRITICAL: LyCodec Decoder ensuring ALL parameters receive gradients
-    Enhanced with comprehensive gradient flow verification
+    CRITICAL: LyCodec Decoder for log-mel + phase reconstruction
+    Reconstructs both log-mel features and phase information
     """
-    def __init__(self, latent_dim=64, base_channels=512, out_channels=2, use_triton=False):
+    def __init__(self, latent_dim=64, base_channels=512, out_channels=N_MELS, use_triton=False):
         super().__init__()
         self.latent_dim = latent_dim
-        self.out_channels = out_channels
+        self.out_channels = out_channels  # N_MELS = 128
         self.use_triton = False  # Force disable
         
         # Initial projection
@@ -397,7 +440,7 @@ class LyDecoder(nn.Module):
             
             current_dim = next_dim
         
-        # f10: Frequency upsampling
+        # f10: Frequency upsampling (mel-scale reconstruction)
         for i in range(3):
             next_dim = max(current_dim // 2, 32)
             
@@ -413,19 +456,28 @@ class LyDecoder(nn.Module):
             
             current_dim = next_dim
         
-        # Final layers
+        # Final layers for mel and phase reconstruction
         self.final_residual = ResidualBlock(current_dim, use_triton=False)
-        self.final_conv = nn.Conv2d(current_dim, out_channels * 2, 3, 1, 1)
-        self.output_activation = nn.Tanh()  # Bounded output
+        
+        # Separate heads for mel and phase
+        self.mel_head = nn.Conv2d(current_dim, out_channels, 3, 1, 1)
+        self.phase_head = nn.Conv2d(current_dim, out_channels, 3, 1, 1)
+        
+        # Output activations
+        self.mel_activation = nn.Identity()  # Log-mel can be any real value
+        self.phase_activation = nn.Tanh()    # Phase bounded to [-π, π] after scaling
         
         # CRITICAL: Gradient ensurer for decoder
         self.gradient_ensurer = nn.Parameter(torch.zeros(1))
         
-        print(f"✅ LyDecoder: Using stable PyTorch with gradient verification")
+        print(f"✅ LyDecoder: Log-mel + phase reconstruction with gradient verification")
         
     def forward(self, latent, target_size=None):
         """
-        CRITICAL: Ensure ALL decoder parameters receive gradients
+        CRITICAL: Reconstruct log-mel and phase from latent
+        Returns:
+            log_mel_out: [B, n_mels, T] reconstructed log-mel spectrogram
+            phase_out: [B, n_mels, T] reconstructed phase information
         """
         x = self.latent_proj(latent)
         
@@ -436,94 +488,138 @@ class LyDecoder(nn.Module):
         for residual_block, conv_layer, norm_layer in zip(
             self.residual_blocks, self.conv_transpose_layers, self.norm_layers
         ):
-            x = residual_block(x)  # No magnitude_spectrum in decoder
+            x = residual_block(x)  # No log_mel_spectrum in decoder
             x = conv_layer(x)
             x = norm_layer(x)
         
         # Final processing
         x = self.final_residual(x)
-        x = self.final_conv(x)
-        x = self.output_activation(x)
         
-        # Reshape to complex spectrogram format
-        B, C, freq_dim, T = x.shape
-        real_imag = x.view(B, self.out_channels, 2, freq_dim, T)
+        # Separate mel and phase reconstruction
+        mel_features = self.mel_head(x)      # [B, n_mels, H, W]
+        phase_features = self.phase_head(x)  # [B, n_mels, H, W]
         
-        # Separate real and imaginary parts
-        real_part = real_imag[:, :, 0]  # [B, out_channels, freq_dim, T]
-        imag_part = real_imag[:, :, 1]  # [B, out_channels, freq_dim, T]
+        # Apply activations
+        mel_features = self.mel_activation(mel_features)
+        phase_features = self.phase_activation(phase_features) * math.pi  # Scale to [-π, π]
+        
+        # Convert back to 1D: [B, n_mels, H, W] -> [B, n_mels, T]
+        # Take the meaningful dimension (typically W for time)
+        if mel_features.shape[2] == 1:  # H=1, W=T
+            log_mel_out = mel_features.squeeze(2)  # [B, n_mels, T]
+            phase_out = phase_features.squeeze(2)  # [B, n_mels, T]
+        else:  # H>1, use adaptive pooling
+            log_mel_out = F.adaptive_avg_pool2d(mel_features, (1, mel_features.shape[-1])).squeeze(2)
+            phase_out = F.adaptive_avg_pool2d(phase_features, (1, phase_features.shape[-1])).squeeze(2)
         
         # Resize to target if specified
         if target_size is not None:
-            target_f, target_t = target_size
+            target_mels, target_t = target_size
             
             if target_t is None:
-                target_t = real_part.shape[-1]
+                target_t = log_mel_out.shape[-1]
             
-            if target_f > 0 and target_t > 0:
-                real_part = F.interpolate(real_part, size=(target_f, target_t), mode='bilinear', align_corners=False)
-                imag_part = F.interpolate(imag_part, size=(target_f, target_t), mode='bilinear', align_corners=False)
+            if target_mels > 0 and target_t > 0:
+                # FIXED: Proper interpolation for [B, n_mels, T] -> [B, target_mels, target_t]
+                if log_mel_out.shape[1] != target_mels or log_mel_out.shape[2] != target_t:
+                    # Reshape for interpolation: [B, n_mels, T] -> [B, 1, n_mels, T]
+                    log_mel_reshaped = log_mel_out.unsqueeze(1)  # [B, 1, n_mels, T]
+                    phase_reshaped = phase_out.unsqueeze(1)      # [B, 1, n_mels, T]
+                    
+                    # Interpolate: [B, 1, n_mels, T] -> [B, 1, target_mels, target_t]
+                    log_mel_interpolated = F.interpolate(
+                        log_mel_reshaped, size=(target_mels, target_t), 
+                        mode='bilinear', align_corners=False
+                    )
+                    phase_interpolated = F.interpolate(
+                        phase_reshaped, size=(target_mels, target_t), 
+                        mode='bilinear', align_corners=False
+                    )
+                    
+                    # Remove extra dimension: [B, 1, target_mels, target_t] -> [B, target_mels, target_t]
+                    log_mel_out = log_mel_interpolated.squeeze(1)
+                    phase_out = phase_interpolated.squeeze(1)
         
-        return real_part, imag_part
+        return log_mel_out, phase_out
 
 class LyCodecModel(nn.Module):
     """
-    CRITICAL: Complete LyCodec model with comprehensive DDP fixes
-    Ensures ALL parameters receive gradients for stable distributed training
+    CRITICAL: Complete LyCodec model for log-mel + phase processing
+    Enhanced architecture for mel-scale audio compression with phase preservation
     """
     def __init__(self, latent_dim=64, base_channels=64, n_layers=6, use_triton=False):
         super().__init__()
         self.use_triton = False  # Force disable globally
         
         self.encoder = LyEncoder(
+            in_channels=N_MELS,
             latent_dim=latent_dim, 
             base_channels=base_channels, 
             n_layers=n_layers, 
             use_triton=False
         )
         self.decoder = LyDecoder(
-            latent_dim=latent_dim, 
+            latent_dim=latent_dim,
+            out_channels=N_MELS,
             use_triton=False
         )
         
         # CRITICAL: Global gradient ensurer for the entire model
         self.global_gradient_ensurer = nn.Parameter(torch.zeros(1))
         
-        print(f"✅ LyCodecModel: Stable PyTorch implementation with comprehensive DDP fixes")
+        print(f"✅ LyCodecModel: Log-mel + phase processing with comprehensive DDP fixes")
         
-    def encode(self, complex_spec, magnitude_spectrum=None):
-        return self.encoder(complex_spec, magnitude_spectrum)
+    def encode(self, log_mel_features, phase_features=None):
+        """
+        Encode log-mel and phase features to latent representation
+        Args:
+            log_mel_features: [B, n_mels, T] log-mel spectrogram
+            phase_features: [B, n_mels, T] phase information (optional)
+        """
+        return self.encoder(log_mel_features, phase_features, log_mel_features)
     
     def decode(self, latent, target_size=None):
+        """
+        Decode latent to log-mel and phase
+        Returns:
+            log_mel_out: [B, n_mels, T] reconstructed log-mel spectrogram
+            phase_out: [B, n_mels, T] reconstructed phase information
+        """
         return self.decoder(latent, target_size)
     
-    def forward(self, complex_spec, magnitude_spectrum=None):
+    def forward(self, log_mel_features, phase_features=None):
         """
-        CRITICAL: Full encode-decode cycle ensuring ALL parameters receive gradients
-        This is essential for DDP compatibility and preventing unused parameter errors
+        CRITICAL: Full encode-decode cycle for log-mel + phase
+        Args:
+            log_mel_features: [B, n_mels, T] log-mel spectrogram
+            phase_features: [B, n_mels, T] phase information (optional)
+        Returns:
+            log_mel_out: [B, n_mels, T] reconstructed log-mel
+            phase_out: [B, n_mels, T] reconstructed phase
+            latent: [B, latent_dim, H, W] latent representation
         """
         # Encode
-        latent = self.encode(complex_spec, magnitude_spectrum)
+        latent = self.encode(log_mel_features, phase_features)
         
         # Decode
-        real_part, imag_part = self.decode(latent, complex_spec.shape[-2:])
+        log_mel_out, phase_out = self.decode(latent, (log_mel_features.shape[1], log_mel_features.shape[2]))
         
         # CRITICAL: Ensure global gradient flow through all parameters
         # Add tiny contribution from global_gradient_ensurer to final outputs
         global_contrib = self.global_gradient_ensurer * 0.00001
-        real_part = real_part + global_contrib
-        imag_part = imag_part + global_contrib
+        log_mel_out = log_mel_out + global_contrib
+        phase_out = phase_out + global_contrib
         
         # CRITICAL: Verify all outputs require gradients during training
         if self.training:
             assert latent.requires_grad, "Latent must require gradients during training"
-            assert real_part.requires_grad, "Real part must require gradients during training"
-            assert imag_part.requires_grad, "Imaginary part must require gradients during training"
+            assert log_mel_out.requires_grad, "Log-mel output must require gradients during training"
+            assert phase_out.requires_grad, "Phase output must require gradients during training"
             
             # CRITICAL: Verify global gradient ensurer is connected
             assert self.global_gradient_ensurer.requires_grad, "Global gradient ensurer must require gradients"
         
-        return real_part, imag_part, latent
+        return log_mel_out, phase_out, latent
     
     def get_unused_parameters(self):
         """
@@ -532,16 +628,16 @@ class LyCodecModel(nn.Module):
         """
         def check_parameter_usage():
             # Create dummy input
-            dummy_complex = torch.randn(1, 2, 2, 512, 256, requires_grad=True)
-            dummy_magnitude = torch.randn(1, 512, 256, requires_grad=True)
+            dummy_log_mel = torch.randn(1, N_MELS, 256, requires_grad=True)
+            dummy_phase = torch.randn(1, N_MELS, 256, requires_grad=True)
             
             # Forward pass
-            real_out, imag_out, latent_out = self.forward(dummy_complex, dummy_magnitude)
+            log_mel_out, phase_out, latent_out = self.forward(dummy_log_mel, dummy_phase)
             
             # Create comprehensive loss that should use all parameters
             total_loss = (
-                real_out.sum() + 
-                imag_out.sum() + 
+                log_mel_out.sum() + 
+                phase_out.sum() + 
                 latent_out.sum() +
                 sum(p.sum() * 0.0001 for p in self.parameters() if p.requires_grad)
             )
