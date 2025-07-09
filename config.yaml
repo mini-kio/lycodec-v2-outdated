@@ -1,184 +1,182 @@
-# LyCodec v2.0 V100×4 최적화 설정 - GPU 활용률 극대화
-# 예상 성능 향상: 4-5배, VRAM 활용률: 80-90%
+# LyCodec v2.0 안정화 설정 - 그래디언트 문제 및 CUDA 오류 해결
+# 성능보다 안정성 우선, 로그 스팸 최소화
 
 # Random seed for reproducibility
 seed: 42
 
-# Data configuration - STEP 4: 배치/시퀀스 재조정
+# Data configuration - 안정성 우선
 data:
   data_dir: "dataset/raw/music"
-  segment_seconds: 4.0                    # 6.0 → 4.0 (STEP 4: STFT·Mel 길이 ×²⁄₃)
-  samples_per_track: 5                    # 증가 - 더 많은 데이터 다양성
-  file_limit: null                        # Use all available audio files
+  segment_seconds: 4.0
+  samples_per_track: 3                    # 메모리 절약
+  file_limit: 100                         # 테스트용 제한
 
-# Model architecture configuration - 대폭 강화된 모델
+# Model architecture configuration - 단순화
 model:
-  latent_dim: 128                         # 64 → 128 (2배 증가)
-  base_channels: 128                      # 64 → 128 (2배 증가) 
-  n_layers: 8                            # 6 → 8 (더 깊은 네트워크)
+  latent_dim: 64                          # 안정적인 크기
+  base_channels: 64                       # 메모리 절약
+  n_layers: 4                            # 단순화
 
-# Training configuration - V100×4 최적화 + STEP 3: DataLoader I/O 튜닝
+# Training configuration - 안정성 최우선
 training:
-  # 배치 설정 - GPU 메모리 활용률 극대화
-  batch_size: 12                          # 16 → 12 (CUDA 오류 방지)
-  accumulate_grad_batches: 2              # 1 → 2 (effective batch 24)
+  # 배치 설정 - 안전한 크기
+  batch_size: 2                           # 작은 배치로 안정성 확보
+  accumulate_grad_batches: 8              # 효과적 배치 16
   
-  # STEP 3: DataLoader I/O 튜닝 - Disk wait ↓, context-switch ↓
-  num_workers: 2                          # 4 → 2 (안정성 우선)
-  persistent_workers: true                # 워커 프로세스 유지로 context-switch 감소
-  prefetch_factor: 2                      # 4 → 2 (메모리 절약)
-  pin_memory: true                        # STEP 5: pinned memory for faster GPU transfer
+  # DataLoader 안정화 - CUDA 오류 방지
+  num_workers: 0                          # 단일 프로세스로 CUDA 오류 방지
+  persistent_workers: false               # 워커 비활성화
+  prefetch_factor: null                   # 워커 없으므로 null
+  pin_memory: true                        # GPU 전송 최적화는 유지
   
   # 최적화 설정
-  learning_rate: 0.0001                   # 0.0002 → 0.0001 (안정성)
-  num_epochs: 500                         # 1000 → 500 (빠른 수렴 예상)
+  learning_rate: 0.0002
+  num_epochs: 100                         # 테스트용 단축
   
   # 정밀도 및 안정성 설정
-  mixed_precision: false                  # true → false (ComplexHalf 오류 방지)
-  gradient_checkpointing: false           # 큰 배치에서는 비활성화로 속도 우선
+  mixed_precision: true                   # FP16으로 메모리 절약
+  gradient_checkpointing: true
   
   # 체크포인팅
-  checkpoint_dir: "checkpoints_optimized"
-  save_every: 25                          # 더 자주 저장
+  checkpoint_dir: "checkpoints_stable"
+  save_every: 10                          # 자주 저장
 
-# Accelerate configuration - V100×4 최적화 (안정성 우선)
+# Accelerate configuration - 단일 GPU 안정화
 accelerate:
-  mixed_precision: "no"                   # "fp16" → "no" (ComplexHalf 오류 방지)
-  gradient_accumulation_steps: 2          
-  num_processes: 4                        
+  mixed_precision: "fp16"
+  gradient_accumulation_steps: 8
+  num_processes: 1                        # 단일 GPU로 안정화
 
-# Audio processing configuration - 텐서 코어 최적화
+# Audio processing configuration
 audio:
-  sample_rate: 44100                      
-  n_fft: 2048                            
-  hop_length: 512                        
-  n_mels: 128                            # 8의 배수 유지 (텐서 코어 최적화)
-  f_min: 20                              
-  f_max: 22050                           
+  sample_rate: 44100
+  n_fft: 2048
+  hop_length: 512
+  n_mels: 128
+  f_min: 20
+  f_max: 22050
   
-  # Psychoacoustic settings - 강화
-  n_gammatone_filters: 64                 
-  psychoacoustic_weight: 0.15             # 0.1 → 0.15 (더 강한 psychoacoustic loss)
+  # Psychoacoustic settings - 단순화
+  n_gammatone_filters: 32                 # 절반으로 축소
+  psychoacoustic_weight: 0.1
   
   # Audio normalization
-  normalize_method: "rms"                 
+  normalize_method: "rms"
 
-# Compression settings - 유지
+# Compression settings
 compression:
-  frequency_compression: 10               
-  time_compression: 10                    
-  total_compression: 100                  
-  mel_compression_factor: 8               
+  frequency_compression: 10
+  time_compression: 10
+  total_compression: 100
+  mel_compression_factor: 8
 
-# Loss function weights - 최적화
+# Loss function weights - 안정화
 loss:
-  log_mel_weight: 1.0                     
-  mel_weight: 0.4                         # 0.3 → 0.4 (강화)
-  phase_weight: 0.6                       # 0.5 → 0.6 (강화)
-  spectral_weight: 0.8                    # 0.7 → 0.8 (강화)
-  time_proxy_weight: 0.25                 # 0.2 → 0.25 (강화)
-  latent_weight: 0.2                      # 0.15 → 0.2 (강화된 정규화)
-  perceptual_weight: 0.15                 # 0.1 → 0.15 (강화)
+  log_mel_weight: 1.0
+  mel_weight: 0.3
+  phase_weight: 0.4
+  spectral_weight: 0.5
+  time_proxy_weight: 0.2
+  latent_weight: 0.1
+  perceptual_weight: 0.1
 
 # Validation settings
 validation:
-  val_split: 0.1                          
-  val_every: 5                            # 10 → 5 (더 자주 검증)
+  val_split: 0.1
+  val_every: 5
 
-# Inference optimization - 강화된 모델에 맞춰 조정
+# Inference optimization
 inference:
-  half_precision: true                    
-  max_chunk_length: 264600                # 6초에 맞춰 증가
-  overlap_length: 4410                    
-  cpu_fallback: true                      
-  mel_processing_batch_size: 40           # 32 → 40 (증가)
+  half_precision: true
+  max_chunk_length: 220500
+  overlap_length: 4410
+  cpu_fallback: true
+  mel_processing_batch_size: 16
 
-# Logging and monitoring
+# Logging and monitoring - 스팸 최소화
 logging:
-  log_level: "INFO"
-  log_every: 50                           # 100 → 50 (더 자주 로깅)
-  tensorboard_dir: "logs_optimized"
+  log_level: "WARNING"                    # INFO에서 WARNING으로 상향
+  log_every: 100                          # 로그 빈도 감소
+  tensorboard_dir: "logs_stable"
 
-# Hardware optimization - V100×4 최대 활용
+# Hardware optimization - 안정성 우선
 hardware:
-  # V100 specific optimizations
-  use_tensor_cores: true                  
-  cudnn_benchmark: true                   
+  use_tensor_cores: false                 # 호환성 문제 방지
+  cudnn_benchmark: false                  # 재현성 우선
   
-  # Memory management - 적극적 활용
-  empty_cache_every: 100                  # 50 → 100 (캐시 클리어 빈도 감소)
-  max_memory_fraction: 0.85               # 0.95 → 0.85 (안정성 위해 감소)
+  # Memory management - 보수적 설정
+  empty_cache_every: 10                   # 자주 캐시 정리
+  max_memory_fraction: 0.7                # 메모리 여유 확보
   
   # Performance settings - 안정성 우선
-  torch_compile: false                    # true → false (dynamo 오류 방지)
-  channels_last: false                    # true → false (안정성 우선)
-  
-# Advanced features - 성능 최적화 (안정성 우선)
+  torch_compile: false                    # 비활성화
+  channels_last: false                    # 안정성 우선
+
+# Advanced features - 최소화
 advanced:
-  use_triton_kernels: false               # 안정성 유지
-  progressive_training: false             
-  perceptual_loss: true                   
-  dynamic_loss_scaling: false             # true → false (FP32 사용시 불필요)
-  mel_domain_augmentation: false          # true → false (안정성 우선)
+  use_triton_kernels: false
+  progressive_training: false
+  perceptual_loss: true
+  dynamic_loss_scaling: false
+  mel_domain_augmentation: false
 
-# WandB experiment tracking
+# WandB experiment tracking - 단순화
 wandb:
-  project: "lycodec-v2-optimized"
-  entity: "your-team"                     
-  enabled: true                           
-  tags: ["lycodec", "v2.0", "optimized", "v100x4", "high-performance"]
-  notes: "V100×4 최적화 버전 - 4-5배 성능 향상 목표, 95% VRAM 활용"
+  project: "lycodec-stable-test"
+  entity: null
+  enabled: true
+  tags: ["lycodec", "stable", "test"]
+  notes: "안정화 테스트 - 그래디언트 및 CUDA 오류 해결"
 
-# Performance optimizations - 새로운 최적화
+# Performance optimizations - 안정성 우선
 optimizations:
-  vectorized_stft: true                   
-  mel_domain_loss: true                   
-  distributed_psychoacoustic: true        
-  gradient_checkpointing: false           # 큰 배치에서는 비활성화
-  phase_continuity: true                  
-  tensor_core_alignment: true             # 새로운 최적화
-  memory_efficient_attention: true        # 새로운 최적화
-  
-# Debug settings - 성능 모니터링 강화
+  vectorized_stft: false                  # 안정성 우선
+  mel_domain_loss: true
+  distributed_psychoacoustic: false       # 단일 GPU
+  gradient_checkpointing: true
+  phase_continuity: true
+  tensor_core_alignment: false            # 호환성 문제 방지
+  memory_efficient_attention: false       # 안정성 우선
+
+# Debug settings - 필수만 유지
 debug:
-  log_first_batch_progress: true          # 첫 배치 진행상황 로깅
-  monitor_gpu_memory: true                
-  profile_slow_operations: false          
-  verify_ddp_compatibility: true          
-  mel_processing_validation: true         
-  phase_preservation_check: true          
-  stft_dimension_verification: true       
-  force_n_fft_consistency: true           
-  performance_profiling: false            # true → false (오버헤드 감소)
+  log_first_batch_progress: false         # 로그 스팸 방지
+  monitor_gpu_memory: true
+  profile_slow_operations: false
+  verify_ddp_compatibility: false          # 단일 GPU
+  mel_processing_validation: false
+  phase_preservation_check: false
+  stft_dimension_verification: false
+  force_n_fft_consistency: true
+  performance_profiling: false
   
-  # 새로운 디버그 설정
-  cuda_error_handling: true               # CUDA 오류 처리 강화
-  memory_leak_detection: true             # 메모리 누수 감지
-  tensor_device_verification: true        # 텐서 디바이스 검증
+  # 안정성 체크만 유지
+  cuda_error_handling: true
+  memory_leak_detection: true
+  tensor_device_verification: false       # 로그 스팸 방지
 
-# 새로운 섹션: V100 특화 최적화 (안정성 우선)
-v100_optimizations:
-  # 텐서 코어 최적화
-  tensor_core_enabled: true
-  optimal_batch_sizes: [8, 12, 16, 20]   # 더 안정적인 배치 크기들
+# 단일 GPU 최적화
+single_gpu_optimizations:
+  tensor_core_enabled: false
+  optimal_batch_sizes: [1, 2, 4]
   
-  # 메모리 최적화  
-  memory_pool_enabled: true
-  memory_pool_size_mb: 12000              # 14000 → 12000 (안정성)
+  # 메모리 최적화
+  memory_pool_enabled: false              # 단순화
+  memory_pool_size_mb: 4000
   
-  # 커널 최적화
-  fused_operations: false                 # true → false (안정성)
-  custom_kernels: false                   # 안정성 우선
+  # 커널 최적화 비활성화
+  fused_operations: false
+  custom_kernels: false
   
-  # 성능 모니터링
-  target_gpu_utilization: 0.80           # 0.90 → 0.80 (안정성)
-  target_memory_utilization: 0.75        # 0.85 → 0.75 (안정성)
-  performance_alert_threshold: 0.60      # 0.75 → 0.60 (더 민감한 알림)
+  # 성능 모니터링 - 보수적
+  target_gpu_utilization: 0.6
+  target_memory_utilization: 0.6
+  performance_alert_threshold: 0.5
 
-# 예상 성능 지표 (안정성 우선 조정)
+# 예상 성능 지표 - 현실적 목표
 expected_performance:
-  batch_processing_time_sec: 1.5         # 1.0s → 1.5s (안정성 고려)
-  gpu_utilization_percent: 80            # 90% → 80% (안정성 고려)
-  memory_utilization_percent: 75         # 85% → 75% (안정성 고려)
-  throughput_improvement_factor: 3.0     # 4.5 → 3.0 (현실적 목표)
-  epoch_time_reduction_percent: 60       # 75% → 60% (현실적 목표)
+  batch_processing_time_sec: 3.0          # 안정성 우선
+  gpu_utilization_percent: 60
+  memory_utilization_percent: 60
+  throughput_improvement_factor: 1.5      # 현실적 목표
+  epoch_time_reduction_percent: 30
