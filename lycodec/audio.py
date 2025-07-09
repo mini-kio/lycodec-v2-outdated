@@ -55,14 +55,13 @@ def stft_transform(waveform, n_fft=N_FFT, hop_length=HOP_LENGTH, window='hann', 
             total_batch *= dim
         waveform = waveform.view(total_batch, original_shape[-1])
     
-    # Create window with proper device and dtype handling
+    # CRITICAL: Create window with proper device and dtype handling
     try:
-        # Create window on CPU first then move to device
-        window_fn = torch.hann_window(n_fft, dtype=torch.float32)
-        window_fn = window_fn.to(device=original_device, dtype=original_dtype)
+        # Try to create window on same device and dtype
+        window_fn = torch.hann_window(n_fft, device=original_device, dtype=original_dtype)
     except Exception as e:
-        # Ultimate fallback: create basic window
-        window_fn = torch.hann_window(n_fft)
+        # Fallback: create on CPU and move
+        window_fn = torch.hann_window(n_fft, dtype=original_dtype)
         window_fn = window_fn.to(device=original_device)
     
     # CRITICAL: STFT computation with proper error handling
@@ -275,12 +274,12 @@ def istft_transform(stft_tensor, n_fft=N_FFT, hop_length=HOP_LENGTH, window='han
     
     return waveform
 
-def create_mel_filterbank(n_mels=N_MELS, n_fft=N_FFT, sample_rate=SAMPLE_RATE, f_min=F_MIN, f_max=F_MAX, device=None):
+def create_mel_filterbank(n_mels=N_MELS, n_fft=N_FFT, sample_rate=SAMPLE_RATE, f_min=F_MIN, f_max=F_MAX):
     """
     Create mel-scale filterbank matrix for STFT magnitude conversion
     """
-    # Calculate frequency points on CPU first
-    freq_points = torch.linspace(0, sample_rate // 2, n_fft // 2 + 1, dtype=torch.float32)
+    # Calculate frequency points
+    freq_points = torch.linspace(0, sample_rate // 2, n_fft // 2 + 1)
     
     # Convert to mel scale
     def hz_to_mel(hz):
@@ -292,11 +291,11 @@ def create_mel_filterbank(n_mels=N_MELS, n_fft=N_FFT, sample_rate=SAMPLE_RATE, f
     # Create mel points
     mel_min = hz_to_mel(torch.tensor(f_min, dtype=torch.float32))
     mel_max = hz_to_mel(torch.tensor(f_max, dtype=torch.float32))
-    mel_points = torch.linspace(mel_min, mel_max, n_mels + 2, dtype=torch.float32)
+    mel_points = torch.linspace(mel_min, mel_max, n_mels + 2)
     hz_points = mel_to_hz(mel_points)
     
-    # Create filter bank on CPU
-    filterbank = torch.zeros(n_mels, n_fft // 2 + 1, dtype=torch.float32)
+    # Create filter bank
+    filterbank = torch.zeros(n_mels, n_fft // 2 + 1)
     
     for m in range(n_mels):
         left = hz_points[m]
@@ -309,10 +308,6 @@ def create_mel_filterbank(n_mels=N_MELS, n_fft=N_FFT, sample_rate=SAMPLE_RATE, f
                 filterbank[m, k] = (freq - left) / (center - left)
             elif center <= freq <= right:
                 filterbank[m, k] = (right - freq) / (right - center)
-    
-    # Move to device if specified
-    if device is not None:
-        filterbank = filterbank.to(device)
     
     return filterbank
 
@@ -329,7 +324,7 @@ def to_mel_spectrogram(magnitude_spec, mel_filterbank=None):
     dtype = magnitude_spec.dtype
     
     if mel_filterbank is None:
-        mel_filterbank = create_mel_filterbank(device=device)
+        mel_filterbank = create_mel_filterbank()
     
     mel_filterbank = mel_filterbank.to(device=device, dtype=dtype)
     
@@ -654,13 +649,13 @@ def _psychoacoustic_masking_pytorch(gammatone_output, threshold_db):
         dtype = gammatone_output.dtype
         
         # Create or retrieve spreading matrix
-        cache_key = (n_filters, str(dtype))  # Convert dtype to string for caching
+        cache_key = (n_filters, dtype)
         if (not hasattr(_psychoacoustic_masking_pytorch, '_spreading_cache') or 
             _psychoacoustic_masking_pytorch._spreading_cache is None or
             _psychoacoustic_masking_pytorch._spreading_cache[0] != cache_key):
             
             # Create spreading matrix
-            spreading_matrix = torch.zeros(n_filters, n_filters, device='cpu', dtype=torch.float32)
+            spreading_matrix = torch.zeros(n_filters, n_filters, device=device, dtype=dtype)
             
             for i in range(n_filters):
                 for j in range(n_filters):
@@ -671,12 +666,10 @@ def _psychoacoustic_masking_pytorch(gammatone_output, threshold_db):
                     else:
                         spreading_matrix[i, j] = 1.0
             
-            # Cache for reuse (store on CPU with float32)
-            _psychoacoustic_masking_pytorch._spreading_cache = (cache_key, spreading_matrix)
+            # Cache for reuse
+            _psychoacoustic_masking_pytorch._spreading_cache = (cache_key, spreading_matrix.cpu())
         
-        # Get cached matrix and convert to target device/dtype
-        cached_matrix = _psychoacoustic_masking_pytorch._spreading_cache[1]
-        spreading_matrix = cached_matrix.to(device=device, dtype=dtype)
+        spreading_matrix = _psychoacoustic_masking_pytorch._spreading_cache[1].to(device=device, dtype=dtype)
         
         # Apply spreading
         B, n_filters, T = power_db.shape

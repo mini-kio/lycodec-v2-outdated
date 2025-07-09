@@ -24,26 +24,10 @@ import random
 from pathlib import Path
 from typing import Dict, Any
 
-# CRITICAL: Disable torch.compile and dynamo to prevent compilation errors
-try:
-    import torch._dynamo
-    torch._dynamo.config.suppress_errors = True
-    torch._dynamo.config.cache_size_limit = 1
-    print("✅ torch._dynamo configured with error suppression")
-except ImportError:
-    print("ℹ️ torch._dynamo not available")
-
 import torch
 from torch.utils.data import DataLoader
 import soundfile as sf
 import numpy as np
-
-# Disable torch.compile globally
-try:
-    torch.compiler.disable()
-    print("✅ torch.compiler disabled globally")
-except:
-    pass
 
 # FIXED: More robust Accelerate imports with version compatibility
 try:

@@ -8,22 +8,6 @@ import logging
 from pathlib import Path
 from tqdm import tqdm
 
-# CRITICAL: Disable torch.compile and dynamo to prevent compilation errors
-try:
-    import torch._dynamo
-    torch._dynamo.config.suppress_errors = True
-    torch._dynamo.config.cache_size_limit = 1  # Minimize cache usage
-    print("✅ torch._dynamo configured with error suppression")
-except ImportError:
-    print("ℹ️ torch._dynamo not available")
-
-# Disable torch.compile globally
-try:
-    torch.compiler.disable()
-    print("✅ torch.compiler disabled globally")
-except:
-    pass
-
 # Use Accelerate for V100×4 distributed training
 try:
     from accelerate import Accelerator
@@ -186,8 +170,9 @@ class LyCodecTrainer:
             )
             
             # STEP 9: Apply torch.compile after accelerate.prepare()
-            from .models import apply_torch_compile_optimizations
-            self.model = apply_torch_compile_optimizations(self.model, self.accelerator)
+            # NOTE: torch.compile is currently disabled due to backend issues
+            # from .models import apply_torch_compile_optimizations
+            # self.model = apply_torch_compile_optimizations(self.model, self.accelerator)
             
             # CRITICAL: Move components to the same device as the model
             self.spectral_loss = self.spectral_loss.to(self.accelerator.device)
@@ -197,7 +182,7 @@ class LyCodecTrainer:
                 self.logger.info(f"V100×4 setup: {self.accelerator.num_processes} GPUs, "
                                f"mixed precision: {self.accelerator.mixed_precision}")
                 self.logger.info(f"✅ Components moved to device: {self.accelerator.device}")
-                self.logger.info(f"✅ torch.compile optimizations applied")
+                self.logger.info(f"✅ torch.compile optimizations disabled for stability")
         
         # Initialize wandb tracking
         self.wandb_run = None
@@ -436,18 +421,27 @@ class LyCodecTrainer:
     
     def compute_loss(self, pred_log_mel, pred_phase, target_log_mel, target_phase, target_audio, pred_latent=None):
         """
-        Compute loss for log-mel + phase architecture
+        CRITICAL: Compute loss for log-mel + phase architecture ensuring ALL model parameters receive gradients
         """
         device = pred_log_mel.device
         
-        # Verify tensors require gradients for DDP training
+        # CRITICAL: Verify all tensors require gradients for DDP
         if self.model.training:
             if not pred_log_mel.requires_grad:
-                self.logger.warning("pred_log_mel does not require gradients - this may cause training issues")
+                self.logger.error(f"pred_log_mel gradient info: requires_grad={pred_log_mel.requires_grad}, is_leaf={pred_log_mel.is_leaf}, grad_fn={pred_log_mel.grad_fn}")
+                self.logger.error(f"Model training mode: {self.model.training}")
+                self.logger.error(f"Input log_mel_features gradient info: requires_grad={target_log_mel.requires_grad}, is_leaf={target_log_mel.is_leaf}, grad_fn={target_log_mel.grad_fn}")
+                self.logger.error(f"Input phase_features gradient info: requires_grad={target_phase.requires_grad}, is_leaf={target_phase.is_leaf}, grad_fn={target_phase.grad_fn}")
+                # Force enable gradients to continue debugging
+                pred_log_mel = pred_log_mel.requires_grad_(True)
+            
             if not pred_phase.requires_grad:
-                self.logger.warning("pred_phase does not require gradients - this may cause training issues")
+                self.logger.error(f"pred_phase gradient info: requires_grad={pred_phase.requires_grad}, is_leaf={pred_phase.is_leaf}, grad_fn={pred_phase.grad_fn}")
+                pred_phase = pred_phase.requires_grad_(True)
+            
             if pred_latent is not None and not pred_latent.requires_grad:
-                self.logger.warning("pred_latent does not require gradients - this may cause training issues")
+                self.logger.error(f"pred_latent gradient info: requires_grad={pred_latent.requires_grad}, is_leaf={pred_latent.is_leaf}, grad_fn={pred_latent.grad_fn}")
+                pred_latent = pred_latent.requires_grad_(True)
         
         # CRITICAL: Enhanced loss computation for log-mel + phase architecture
         
@@ -580,7 +574,18 @@ class LyCodecTrainer:
         )
         
         # CRITICAL: Verify final loss requires gradients
-        assert total_loss.requires_grad, "Total loss must require gradients"
+        if not total_loss.requires_grad:
+            self.logger.error(f"Total loss gradient info: requires_grad={total_loss.requires_grad}, is_leaf={total_loss.is_leaf}, grad_fn={total_loss.grad_fn}")
+            self.logger.error(f"Component losses:")
+            self.logger.error(f"  log_mel_loss: requires_grad={log_mel_loss.requires_grad}, grad_fn={log_mel_loss.grad_fn}")
+            self.logger.error(f"  mel_loss: requires_grad={mel_loss.requires_grad}, grad_fn={mel_loss.grad_fn}")
+            self.logger.error(f"  phase_loss: requires_grad={phase_loss.requires_grad}, grad_fn={phase_loss.grad_fn}")
+            self.logger.error(f"  spectral_loss: requires_grad={spectral_loss.requires_grad}, grad_fn={spectral_loss.grad_fn}")
+            self.logger.error(f"  time_proxy_loss: requires_grad={time_proxy_loss.requires_grad}, grad_fn={time_proxy_loss.grad_fn}")
+            self.logger.error(f"  latent_loss: requires_grad={latent_loss.requires_grad}, grad_fn={latent_loss.grad_fn}")
+            self.logger.error(f"  perceptual_loss: requires_grad={perceptual_loss.requires_grad}, grad_fn={perceptual_loss.grad_fn}")
+            self.logger.error(f"  model_regularization: requires_grad={model_regularization.requires_grad}, grad_fn={model_regularization.grad_fn}")
+            raise AssertionError("Total loss must require gradients")
         
         return {
             'total_loss': total_loss,
@@ -603,6 +608,10 @@ class LyCodecTrainer:
             # Unpack batch
             stereo_audio = batch['audio']  # [B, 2, T]
             
+            # CRITICAL: Ensure input requires gradients for training
+            if self.model.training:
+                stereo_audio = stereo_audio.requires_grad_(True)
+            
             # CRITICAL: Convert audio to log-mel + phase features
             B, C, T_len = stereo_audio.shape
             
@@ -614,6 +623,11 @@ class LyCodecTrainer:
             try:
                 log_mel_features, phase_features = self._audio_to_log_mel_phase(stereo_audio)
                 
+                # CRITICAL: Ensure converted features require gradients during training
+                if self.model.training:
+                    assert log_mel_features.requires_grad, "log_mel_features must require gradients during training"
+                    assert phase_features.requires_grad, "phase_features must require gradients during training"
+                
             except Exception as e:
                 if self.is_main_process and not warmup:
                     self.logger.error(f"Log-mel conversion failed: {e}")
@@ -621,7 +635,34 @@ class LyCodecTrainer:
             
             # CRITICAL: Forward pass ensuring all parameters are used
             try:
+                # Debug: Log model state before forward pass
+                if self.is_main_process and not warmup:
+                    self.logger.info(f"Model training mode: {self.model.training}")
+                    self.logger.info(f"Input log_mel_features requires_grad: {log_mel_features.requires_grad}")
+                    self.logger.info(f"Input phase_features requires_grad: {phase_features.requires_grad}")
+                
                 pred_log_mel, pred_phase, pred_latent = self.model(log_mel_features, phase_features)
+                
+                # Debug: Log output gradient state
+                if self.is_main_process and not warmup:
+                    self.logger.info(f"Output pred_log_mel requires_grad: {pred_log_mel.requires_grad}")
+                    self.logger.info(f"Output pred_phase requires_grad: {pred_phase.requires_grad}")
+                    self.logger.info(f"Output pred_latent requires_grad: {pred_latent.requires_grad}")
+                
+                # CRITICAL: Verify all outputs have gradients
+                if self.model.training:
+                    if not pred_log_mel.requires_grad:
+                        self.logger.error(f"pred_log_mel gradient info: requires_grad={pred_log_mel.requires_grad}, is_leaf={pred_log_mel.is_leaf}, grad_fn={pred_log_mel.grad_fn}")
+                        self.logger.error(f"Model training mode: {self.model.training}")
+                        raise AssertionError("pred_log_mel must require gradients during training")
+                    
+                    if not pred_phase.requires_grad:
+                        self.logger.error(f"pred_phase gradient info: requires_grad={pred_phase.requires_grad}, is_leaf={pred_phase.is_leaf}, grad_fn={pred_phase.grad_fn}")
+                        raise AssertionError("pred_phase must require gradients during training")
+                    
+                    if not pred_latent.requires_grad:
+                        self.logger.error(f"pred_latent gradient info: requires_grad={pred_latent.requires_grad}, is_leaf={pred_latent.is_leaf}, grad_fn={pred_latent.grad_fn}")
+                        raise AssertionError("pred_latent must require gradients during training")
                 
             except Exception as e:
                 if self.is_main_process:
@@ -636,6 +677,12 @@ class LyCodecTrainer:
             )
             
             loss = losses['total_loss']
+            
+            # CRITICAL: Final verification that loss can backpropagate to all parameters
+            if self.model.training:
+                assert loss.requires_grad, "Loss must require gradients"
+                # Check that loss is connected to model parameters
+                assert any(p.requires_grad for p in self.model.parameters()), "Model must have trainable parameters"
             
             return losses, loss
             

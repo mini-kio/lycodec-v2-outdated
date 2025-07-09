@@ -20,30 +20,30 @@ model:
 # Training configuration - V100×4 최적화 + STEP 3: DataLoader I/O 튜닝
 training:
   # 배치 설정 - GPU 메모리 활용률 극대화
-  batch_size: 16                          # 20 → 16 (STEP 4: 배치 재조정)
-  accumulate_grad_batches: 1              # 2 → 1 (STEP 4: grad-accum 최적화)
+  batch_size: 12                          # 16 → 12 (CUDA 오류 방지)
+  accumulate_grad_batches: 2              # 1 → 2 (effective batch 24)
   
   # STEP 3: DataLoader I/O 튜닝 - Disk wait ↓, context-switch ↓
-  num_workers: 4                          # 12 → 4 (코어 수 ≈ 워커)
+  num_workers: 2                          # 4 → 2 (안정성 우선)
   persistent_workers: true                # 워커 프로세스 유지로 context-switch 감소
-  prefetch_factor: 4                      # 4개 배치 미리 로드
+  prefetch_factor: 2                      # 4 → 2 (메모리 절약)
   pin_memory: true                        # STEP 5: pinned memory for faster GPU transfer
   
   # 최적화 설정
-  learning_rate: 0.0002                   # 큰 배치에 맞춰 증가
+  learning_rate: 0.0001                   # 0.0002 → 0.0001 (안정성)
   num_epochs: 500                         # 1000 → 500 (빠른 수렴 예상)
   
   # 정밀도 및 안정성 설정
-  mixed_precision: true                   # FP16 유지
+  mixed_precision: false                  # true → false (ComplexHalf 오류 방지)
   gradient_checkpointing: false           # 큰 배치에서는 비활성화로 속도 우선
   
   # 체크포인팅
   checkpoint_dir: "checkpoints_optimized"
   save_every: 25                          # 더 자주 저장
 
-# Accelerate configuration - V100×4 최적화
+# Accelerate configuration - V100×4 최적화 (안정성 우선)
 accelerate:
-  mixed_precision: "fp16"                 
+  mixed_precision: "no"                   # "fp16" → "no" (ComplexHalf 오류 방지)
   gradient_accumulation_steps: 2          
   num_processes: 4                        
 
@@ -107,19 +107,19 @@ hardware:
   
   # Memory management - 적극적 활용
   empty_cache_every: 100                  # 50 → 100 (캐시 클리어 빈도 감소)
-  max_memory_fraction: 0.95               # 0.85 → 0.95 (95% 활용)
+  max_memory_fraction: 0.85               # 0.95 → 0.85 (안정성 위해 감소)
   
-  # Performance settings
-  torch_compile: false                    # DISABLED due to dynamo compatibility issues
-  channels_last: true                     # false → true (메모리 효율성)
+  # Performance settings - 안정성 우선
+  torch_compile: false                    # true → false (dynamo 오류 방지)
+  channels_last: false                    # true → false (안정성 우선)
   
-# Advanced features - 성능 최적화
+# Advanced features - 성능 최적화 (안정성 우선)
 advanced:
   use_triton_kernels: false               # 안정성 유지
   progressive_training: false             
   perceptual_loss: true                   
-  dynamic_loss_scaling: true              # false → true (FP16 최적화)
-  mel_domain_augmentation: true           # false → true (데이터 증강)
+  dynamic_loss_scaling: false             # true → false (FP32 사용시 불필요)
+  mel_domain_augmentation: false          # true → false (안정성 우선)
 
 # WandB experiment tracking
 wandb:
@@ -149,31 +149,36 @@ debug:
   phase_preservation_check: true          
   stft_dimension_verification: true       
   force_n_fft_consistency: true           
-  performance_profiling: true             # 새로운 프로파일링
+  performance_profiling: false            # true → false (오버헤드 감소)
+  
+  # 새로운 디버그 설정
+  cuda_error_handling: true               # CUDA 오류 처리 강화
+  memory_leak_detection: true             # 메모리 누수 감지
+  tensor_device_verification: true        # 텐서 디바이스 검증
 
-# 새로운 섹션: V100 특화 최적화
+# 새로운 섹션: V100 특화 최적화 (안정성 우선)
 v100_optimizations:
   # 텐서 코어 최적화
   tensor_core_enabled: true
-  optimal_batch_sizes: [16, 20, 24, 32]  # V100에 최적화된 배치 크기들
+  optimal_batch_sizes: [8, 12, 16, 20]   # 더 안정적인 배치 크기들
   
   # 메모리 최적화  
   memory_pool_enabled: true
-  memory_pool_size_mb: 14000              # 14GB 메모리 풀
+  memory_pool_size_mb: 12000              # 14000 → 12000 (안정성)
   
   # 커널 최적화
-  fused_operations: true
+  fused_operations: false                 # true → false (안정성)
   custom_kernels: false                   # 안정성 우선
   
   # 성능 모니터링
-  target_gpu_utilization: 0.90           # 90% 목표
-  target_memory_utilization: 0.85        # 85% 목표
-  performance_alert_threshold: 0.75      # 75% 아래로 떨어지면 알림
+  target_gpu_utilization: 0.80           # 0.90 → 0.80 (안정성)
+  target_memory_utilization: 0.75        # 0.85 → 0.75 (안정성)
+  performance_alert_threshold: 0.60      # 0.75 → 0.60 (더 민감한 알림)
 
-# 예상 성능 지표
+# 예상 성능 지표 (안정성 우선 조정)
 expected_performance:
-  batch_processing_time_sec: 1.0         # 3.5s → 1.0s 예상
-  gpu_utilization_percent: 90            # 25% → 90% 예상  
-  memory_utilization_percent: 85         # 25% → 85% 예상
-  throughput_improvement_factor: 4.5     # 4.5배 향상 예상
-  epoch_time_reduction_percent: 75       # 75% 시간 단축 예상
+  batch_processing_time_sec: 1.5         # 1.0s → 1.5s (안정성 고려)
+  gpu_utilization_percent: 80            # 90% → 80% (안정성 고려)
+  memory_utilization_percent: 75         # 85% → 75% (안정성 고려)
+  throughput_improvement_factor: 3.0     # 4.5 → 3.0 (현실적 목표)
+  epoch_time_reduction_percent: 60       # 75% → 60% (현실적 목표)
