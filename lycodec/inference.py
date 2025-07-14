@@ -6,7 +6,7 @@ import warnings
 from typing import Union, Optional, Tuple, List
 from contextlib import contextmanager
 
-from .models import LyCodecModel
+from .models import Model
 from .audio import (
     to_complex_spec, 
     to_waveform, 
@@ -24,10 +24,10 @@ from .audio import (
     N_MELS
 )
 
-class LyCodec:
+class Codec:
     """
-    LyCodec inference engine - SIMPLIFIED AND STABLE VERSION
-    Log-mel + phase processing with improved stability and reduced complexity
+    FIXED: 단순화된 LyCodec 추론 엔진
+    Log-mel + phase processing with improved stability
     """
     
     def __init__(self, 
@@ -59,7 +59,7 @@ class LyCodec:
         self.mel_filterbank = create_mel_filterbank(n_mels=N_MELS, n_fft=N_FFT).to(self.device)
         
         # Load model with simplified error handling
-        self.model = LyCodecModel()
+        self.model = Model()
         if model_path:
             self._load_model(model_path)
         
@@ -577,3 +577,6 @@ class LyCodec:
                 'reconstructed_shape': (2, 0),
                 'architecture': 'log_mel_phase'
             }
+
+# Backward compatibility
+LyCodec = Codec  

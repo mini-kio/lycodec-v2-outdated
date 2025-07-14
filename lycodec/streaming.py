@@ -1,19 +1,23 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+import soundfile as sf
+from pathlib import Path
+import warnings
 from typing import Iterator, Optional, Tuple
 from contextlib import contextmanager
 import threading
 import queue
 import time
 
-from .inference import LyCodec
+from .inference import Codec
 from .audio import HOP_LENGTH, SAMPLE_RATE, N_MELS
 
 class StreamingDecoder:
     """
-    SIMPLIFIED: Real-time streaming decoder for LyCodec
-    Reduced complexity for stability, minimal logging
+    FIXED: 단순화된 real-time streaming decoder
+    안정성을 위해 복잡성 최소화
     """
     
     def __init__(self, 
@@ -35,7 +39,7 @@ class StreamingDecoder:
         
         # Initialize codec with simplified settings
         try:
-            self.codec = LyCodec(
+            self.codec = Codec(
                 model_path=model_path,
                 device=device,
                 half_precision=True,
@@ -44,7 +48,7 @@ class StreamingDecoder:
             )
         except Exception:
             # Fallback to dummy model
-            self.codec = LyCodec(
+            self.codec = Codec(
                 model_path=None,
                 device=device,
                 half_precision=True,
@@ -343,4 +347,4 @@ def create_streaming_decoder(model_path: str, latency_ms: float = 100) -> Stream
             model_path=None,
             chunk_size=chunk_size,
             overlap_ratio=0.5
-        )
+        )  

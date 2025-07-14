@@ -2,10 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-import math
-import hashlib
+import soundfile as sf
+from pathlib import Path
 import warnings
 import importlib.util
+import math
 
 # Global audio parameters
 SAMPLE_RATE = 44100
@@ -148,11 +149,11 @@ def create_mel_filterbank(n_mels=N_MELS, n_fft=N_FFT, sample_rate=SAMPLE_RATE, f
         center = hz_points[m + 1]
         right = hz_points[m + 2]
         
-        for k, freq in enumerate(freq_points):
-            if left <= freq <= center:
-                filterbank[m, k] = (freq - left) / (center - left)
-            elif center <= freq <= right:
-                filterbank[m, k] = (right - freq) / (right - center)
+        mask_left = (freq_points >= left) & (freq_points <= center)
+        mask_center = (freq_points > center) & (freq_points <= right)
+        
+        filterbank[m, mask_left] = (freq_points[mask_left] - left) / (center - left + 1e-8)
+        filterbank[m, mask_center] = (right - freq_points[mask_center]) / (right - center + 1e-8)
     
     return filterbank
 
@@ -169,8 +170,8 @@ def to_mel_spectrogram(magnitude_spec, mel_filterbank=None):
     # Apply mel filterbank
     B, F, T = magnitude_spec.shape
     magnitude_flat = magnitude_spec.transpose(1, 2).reshape(-1, F)
-    mel_flat = torch.matmul(mel_filterbank, magnitude_flat.T)
-    mel_spec = mel_flat.T.reshape(B, T, -1).transpose(1, 2)
+    mel_flat = torch.matmul(magnitude_flat, mel_filterbank.T)
+    mel_spec = mel_flat.reshape(B, T, -1).transpose(1, 2)
     
     return mel_spec
 
@@ -201,8 +202,8 @@ def mel_to_magnitude(mel_spec, mel_filterbank=None, n_fft=N_FFT):
     # Apply inverse
     B, n_mels, T = mel_spec.shape
     mel_flat = mel_spec.transpose(1, 2).reshape(-1, n_mels)
-    magnitude_flat = torch.matmul(mel_filterbank_pinv.T, mel_flat.T)
-    magnitude_spec = magnitude_flat.T.reshape(B, T, -1).transpose(1, 2)
+    magnitude_flat = torch.matmul(mel_flat, mel_filterbank_pinv.T)
+    magnitude_spec = magnitude_flat.reshape(B, T, -1).transpose(1, 2)
     
     return magnitude_spec
 
@@ -307,7 +308,9 @@ def create_deterministic_seed(path_str):
     return int(hash_obj.hexdigest()[:8], 16)
 
 class GammatoneFilterbank(nn.Module):
-    """Simplified Gammatone filterbank with guaranteed gradient flow"""
+    """
+    FIXED: DDP 안전한 Gammatone filterbank - 파라미터 재사용 문제 해결
+    """
     def __init__(self, n_filters=64, f_min=F_MIN, f_max=F_MAX, sample_rate=SAMPLE_RATE):
         super().__init__()
         self.n_filters = n_filters
@@ -327,7 +330,7 @@ class GammatoneFilterbank(nn.Module):
         erb_widths = 24.7 * (4.37 * center_freqs / 1000 + 1)
         self.register_buffer('erb_widths', erb_widths)
         
-        # Learnable parameters for gradient flow
+        # FIXED: DDP 안전한 learnable parameters - 단순화
         self.filter_weights = nn.Parameter(torch.ones(n_filters))
         self.bias = nn.Parameter(torch.zeros(n_filters))
         
@@ -342,7 +345,7 @@ class GammatoneFilterbank(nn.Module):
         return (10**(erb / 21.4) - 1) / 0.00437
     
     def forward(self, magnitude_spectrum):
-        """FIXED: Guaranteed gradient flow through all parameters"""
+        """FIXED: DDP 안전한 forward pass - 파라미터 재사용 방지"""
         B, n_mels, T = magnitude_spectrum.shape
         
         # Map mel bins to frequency ranges
@@ -354,7 +357,7 @@ class GammatoneFilterbank(nn.Module):
         center_freqs = self.center_freqs.to(magnitude_spectrum.dtype)
         erb_widths = self.erb_widths.to(magnitude_spectrum.dtype)
         
-        # Vectorized gammatone responses
+        # Vectorized gammatone responses - 단순화
         freq_diff = mel_freq_centers.unsqueeze(1) - center_freqs.unsqueeze(0)
         
         sample_rate_tensor = torch.tensor(
@@ -363,24 +366,26 @@ class GammatoneFilterbank(nn.Module):
             dtype=magnitude_spectrum.dtype
         )
         
+        # FIXED: 기본 gammatone response 계산
         responses = torch.exp(-2 * math.pi * erb_widths.unsqueeze(0) * 
                             torch.abs(freq_diff) / sample_rate_tensor)
         
-        # Apply learnable weights
+        # FIXED: filter_weights만 사용 (frequency_shift와 scale_factor 제거)
         weighted_responses = responses * self.filter_weights.unsqueeze(0)
         
         # Apply filters
         magnitude_reshaped = magnitude_spectrum.permute(0, 2, 1).contiguous().view(-1, n_mels)
+        # (B⋅T, 128)  @  (128, 64) → (B⋅T, 64)  OK
         filtered_reshaped = torch.matmul(magnitude_reshaped, weighted_responses)
         filtered_output = filtered_reshaped.view(B, T, self.n_filters).permute(0, 2, 1)
         
-        # Add bias
+        # FIXED: bias만 사용
         filtered_output = filtered_output + self.bias.unsqueeze(0).unsqueeze(-1)
         
         return filtered_output
 
 def psychoacoustic_masking(gammatone_output, threshold_db=-60):
-    """Simplified psychoacoustic masking"""
+    """FIXED: 단순화된 psychoacoustic masking - 항상 일관된 출력"""
     try:
         # Convert to dB
         eps = 1e-10
@@ -390,7 +395,7 @@ def psychoacoustic_masking(gammatone_output, threshold_db=-60):
         device = gammatone_output.device
         dtype = gammatone_output.dtype
         
-        # Simple spreading matrix
+        # Simple spreading matrix - 항상 동일한 처리
         spreading_matrix = torch.eye(n_filters, device=device, dtype=dtype)
         
         # Add neighboring spreading
@@ -412,6 +417,7 @@ def psychoacoustic_masking(gammatone_output, threshold_db=-60):
         return masking_curve
         
     except Exception:
+        # FIXED: 항상 일관된 fallback
         return torch.ones_like(gammatone_output) * threshold_db
 
 def to_complex_spec(waveform):
@@ -490,8 +496,7 @@ def dynamic_range_compression(magnitude, ratio=4.0, threshold=0.1, knee_width=0.
 
 class SpectralLoss(nn.Module):
     """
-    FIXED: Spectral loss with guaranteed gradient flow
-    All operations ensure gradients flow to parameters
+    FIXED: DDP 안전한 spectral loss - 파라미터 재사용 방지
     """
     def __init__(self, n_mels=N_MELS, alpha=1.0, beta=1.0, gamma=1.0):
         super().__init__()
@@ -503,15 +508,14 @@ class SpectralLoss(nn.Module):
         # Create mel filterbank
         self.register_buffer('mel_filterbank', create_mel_filterbank(n_mels=n_mels))
         
-        # FIXED: Learnable parameters to ensure gradient flow
-        self.scale_weights = nn.Parameter(torch.ones(3))
-        self.loss_bias = nn.Parameter(torch.zeros(1))
+        # FIXED: DDP 안전한 단일 learnable parameter
+        self.loss_scale = nn.Parameter(torch.ones(1))
     
     def forward(self, pred_log_mel, target_log_mel, pred_phase=None, target_phase=None):
-        """FIXED: All computations maintain gradient flow"""
+        """FIXED: DDP 안전한 loss computation"""
         device = pred_log_mel.device
         
-        # 1. Log-mel magnitude loss - directly from inputs
+        # 1. Log-mel magnitude loss
         log_mel_loss = F.l1_loss(pred_log_mel, target_log_mel)
         
         # 2. Mel-scale loss - convert back to linear
@@ -519,22 +523,20 @@ class SpectralLoss(nn.Module):
         target_mel = from_log_mel(target_log_mel)
         mel_loss = F.mse_loss(pred_mel, target_mel)
         
-        # 3. Phase loss - only if both provided
+        # 3. Phase loss
         if pred_phase is not None and target_phase is not None:
             magnitude_weight = target_mel / (target_mel.amax(dim=(-1, -2), keepdim=True) + 1e-8)
             phase_diff_cos = torch.cos(pred_phase - target_phase)
             weighted_phase_loss = (1 - phase_diff_cos) * magnitude_weight
             phase_loss = weighted_phase_loss.mean()
         else:
-            # FIXED: Create phase_loss from inputs to maintain gradient flow
-            phase_loss = pred_log_mel.mean() * 0.0  # Zero but maintains gradient
+            phase_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
-        # FIXED: Combine with learnable weights to ensure all parameters get gradients
-        total_loss = (
-            self.scale_weights[0] * self.alpha * log_mel_loss +
-            self.scale_weights[1] * self.beta * mel_loss +
-            self.scale_weights[2] * self.gamma * phase_loss +
-            self.loss_bias
+        # FIXED: 단일 loss_scale parameter 사용
+        total_loss = self.loss_scale * (
+            self.alpha * log_mel_loss +
+            self.beta * mel_loss +
+            self.gamma * phase_loss
         )
         
         return total_loss
@@ -575,4 +577,4 @@ def gammatone_filterbank(spectrum, n_filters=64):
 
 def get_optimal_pin_memory():
     """Get optimal pin_memory setting"""
-    return torch.cuda.is_available()
+    return torch.cuda.is_available() 

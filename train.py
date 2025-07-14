@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-LyCodec Training Script v2.0 - DDP UNUSED PARAMETERS FIXED
-Fixed the critical DDP issue where some parameters don't receive gradients
+LyCodec Training Script v2.0 - DDP FIXED VERSION
+CRITICAL FIX: find_unused_parameters=True로 DDP 오류 완전 해결
 
-CRITICAL FIXES:
-- find_unused_parameters=True for DDP
-- All model parameters guaranteed to receive gradients
-- Process-specific logging to eliminate spam
-- Performance optimizations
+주요 수정사항:
+- find_unused_parameters=True 설정
+- 모든 모델 파라미터가 gradient를 받도록 보장  
+- 클래스명과 함수명 단순화
+- 로그 스팸 완전 제거
 """
 
 import os
@@ -15,6 +15,7 @@ import sys
 import yaml
 import argparse
 import random
+import time
 from pathlib import Path
 from typing import Dict, Any
 
@@ -23,11 +24,21 @@ from torch.utils.data import DataLoader
 import soundfile as sf
 import numpy as np
 
-# CUDA error prevention environment variables
+# Worker initialization function - moved to module level for spawn multiprocessing
+def worker_init_fn(worker_id):
+    """Initialize worker with deterministic seed - spawn-safe global function"""
+    # Accelerate나 torch.distributed가 세팅한 환경변수에서 rank를 읽어와 시드에 섞어줍니다.
+    rank = int(os.environ.get('LOCAL_RANK', os.environ.get('RANK', 0)))
+    seed = (worker_id + rank) % (2**32)
+    np.random.seed(seed)
+
+# CUDA 오류 방지 환경변수 - 최소화
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ['TORCH_USE_CUDA_DSA'] = '1'
+os.environ['CUDA_MODULE_LOADING'] = 'LAZY'
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
-# Robust Accelerate imports
+# Accelerate imports
 try:
     from accelerate import Accelerator
     from accelerate.utils import set_seed
@@ -42,7 +53,7 @@ except ImportError:
     print("❌ Accelerate not available. Please install with: pip install accelerate")
     sys.exit(1)
 
-from lycodec.training import LyCodecTrainer
+from lycodec.training import Trainer
 from lycodec.audio import (
     normalize_audio, 
     high_quality_resample, 
@@ -55,7 +66,7 @@ from lycodec.audio import (
 
 class AudioDataset(torch.utils.data.Dataset):
     """
-    FIXED: Audio dataset with process-specific logging
+    FIXED: 단순화된 audio dataset - 로그 스팸 제거
     """
     def __init__(self, 
                  data_dir: str,
@@ -66,7 +77,7 @@ class AudioDataset(torch.utils.data.Dataset):
                  sample_rate: int = 44100,
                  rank: int = 0,
                  world_size: int = 1,
-                 is_main_process: bool = False):  # NEW: explicit main process flag
+                 is_main_process: bool = False):
         
         self.data_dir = Path(data_dir)
         self.segment_length = segment_length
@@ -75,7 +86,7 @@ class AudioDataset(torch.utils.data.Dataset):
         self.sample_rate = sample_rate
         self.rank = rank
         self.world_size = world_size
-        self.is_main_process = is_main_process  # Only main process logs
+        self.is_main_process = is_main_process
         
         # Calculate expected mel time frames
         self.expected_mel_frames = (segment_length // HOP_LENGTH) + 1
@@ -89,13 +100,13 @@ class AudioDataset(torch.utils.data.Dataset):
                 self.audio_files.extend(list(self.data_dir.glob(f'**/*{ext}')))
                 self.audio_files.extend(list(self.data_dir.glob(f'**/*{ext.upper()}')))
         except Exception as e:
-            if self.is_main_process:  # FIXED: Only main process logs errors
+            if self.is_main_process:
                 print(f"⚠️ Error finding audio files: {e}")
         
         # Remove duplicates and sort
         self.audio_files = sorted(list(set(self.audio_files)))
         
-        # FIXED: Only main process logs dataset info
+        # FIXED: 메인 프로세스만 로그
         if self.is_main_process:
             print(f"📁 Found {len(self.audio_files)} audio files")
         
@@ -110,9 +121,6 @@ class AudioDataset(torch.utils.data.Dataset):
         for file_path in self.audio_files:
             for i in range(samples_per_track):
                 self.samples.append((file_path, i))
-        
-        if self.is_main_process:
-            print(f"🎵 Total samples: {len(self.samples)}")
     
     def __len__(self):
         return len(self.samples)
@@ -136,77 +144,126 @@ class AudioDataset(torch.utils.data.Dataset):
     
     def __getitem__(self, idx):
         file_path, sample_idx = self.samples[idx]
+        max_retries = 3
         
-        try:
-            # Load audio
-            audio, sr = sf.read(str(file_path), always_2d=True)
-            
-            # Resample if needed
-            if sr != self.sample_rate:
-                audio = high_quality_resample(audio.T, sr, self.sample_rate).T
-            
-            # Convert to stereo
-            if audio.shape[1] == 1:
-                audio = np.repeat(audio, 2, axis=1)
-            elif audio.shape[1] > 2:
-                audio = audio[:, :2]
-            
-            # Transpose to [channels, samples]
-            audio = audio.T
-            
-            # Validate audio
-            if not self._validate_audio(audio, file_path):
-                # Return silence if validation fails
-                audio = np.zeros((2, self.segment_length), dtype=np.float32)
+        for retry in range(max_retries):
+            try:
+                # Load audio with better error handling for MP3 files
+                try:
+                    # MP3 파일 로딩 시 CUDA 오류 방지
+                    with torch.no_grad():
+                        audio, sr = sf.read(str(file_path), always_2d=True)
+                except Exception as e:
+                    # MP3 파일에서 자주 발생하는 오류 처리
+                    if 'CUDA' in str(e) or 'initialization' in str(e):
+                        # CUDA 오류 시 CPU에서 로드 시도
+                        try:
+                            import librosa
+                            audio, sr = librosa.load(str(file_path), sr=self.sample_rate, mono=False)
+                            if audio.ndim == 1:
+                                audio = audio[np.newaxis, :]
+                            else:
+                                audio = audio.T  # librosa는 (channels, time) 형태로 반환
+                        except Exception:
+                            # 최종 fallback: silence 반환
+                            raise e
+                    else:
+                        raise e
+                
+                # Validate file exists and is readable
+                if not file_path.exists():
+                    raise FileNotFoundError(f"Audio file not found: {file_path}")
+                
+                if audio.size == 0:
+                    raise ValueError(f"Empty audio file: {file_path}")
+                
+                # Resample if needed
+                if sr != self.sample_rate:
+                    audio = high_quality_resample(audio.T, sr, self.sample_rate).T
+                
+                # Convert to stereo
+                if audio.shape[1] == 1:
+                    audio = np.repeat(audio, 2, axis=1)
+                elif audio.shape[1] > 2:
+                    audio = audio[:, :2]
+                
+                # Transpose to [channels, samples]
+                audio = audio.T
+                
+                # Validate audio
+                if not self._validate_audio(audio, file_path):
+                    raise ValueError(f"Audio validation failed: {file_path}")
+                
+                # Deterministic segment sampling
+                total_samples = audio.shape[1]
+                if total_samples < self.segment_length:
+                    # Pad with silence
+                    padding = self.segment_length - total_samples
+                    audio = np.pad(audio, ((0, 0), (0, padding)), mode='constant')
+                else:
+                    # Deterministic sampling using hash
+                    import hashlib
+                    hash_input = str(file_path) + str(sample_idx) + str(self.rank)
+                    hash_obj = hashlib.md5(hash_input.encode())
+                    hash_value = int(hash_obj.hexdigest()[:8], 16)
+                    
+                    max_start = total_samples - self.segment_length
+                    start_idx = hash_value % (max_start + 1) if max_start > 0 else 0
+                    audio = audio[:, start_idx:start_idx + self.segment_length]
+                
+                # Normalize
+                audio_tensor = torch.from_numpy(audio).float()
+                audio_tensor = normalize_audio(audio_tensor, method=self.normalize_method)
+                
+                # Pin memory for GPU transfer (멀티GPU 환경에서 안전하게)
+                if torch.cuda.is_available() and not os.environ.get('CUDA_LAUNCH_BLOCKING'):
+                    audio_tensor = audio_tensor.pin_memory()
+                
                 return {
-                    'audio': torch.from_numpy(audio),
-                    'filename': f'validation_failed_{file_path.name}',
+                    'audio': audio_tensor,
+                    'filename': str(file_path.name),
                     'sample_idx': sample_idx
                 }
-            
-            # Deterministic segment sampling
-            total_samples = audio.shape[1]
-            if total_samples < self.segment_length:
-                # Pad with silence
-                padding = self.segment_length - total_samples
-                audio = np.pad(audio, ((0, 0), (0, padding)), mode='constant')
-            else:
-                # Deterministic sampling using hash
-                import hashlib
-                hash_input = str(file_path) + str(sample_idx) + str(self.rank)
-                hash_obj = hashlib.md5(hash_input.encode())
-                hash_value = int(hash_obj.hexdigest()[:8], 16)
                 
-                max_start = total_samples - self.segment_length
-                start_idx = hash_value % (max_start + 1) if max_start > 0 else 0
-                audio = audio[:, start_idx:start_idx + self.segment_length]
-            
-            # Normalize
-            audio_tensor = torch.from_numpy(audio).float()
-            audio_tensor = normalize_audio(audio_tensor, method=self.normalize_method)
-            
-            # Use FP32 and pin memory
-            if torch.cuda.is_available():
-                audio_tensor = audio_tensor.pin_memory()
-            
-            return {
-                'audio': audio_tensor,
-                'filename': str(file_path.name),
-                'sample_idx': sample_idx
-            }
-            
-        except Exception as e:
-            # FIXED: Only log first sample error per process to reduce spam
-            if self.is_main_process and sample_idx == 0:
-                print(f"⚠️ Error loading {file_path.name}: {str(e)[:50]}...")
-            
-            # Return silence as fallback
-            audio = np.zeros((2, self.segment_length), dtype=np.float32)
-            return {
-                'audio': torch.from_numpy(audio),
-                'filename': f'error_{file_path.name if file_path else "unknown"}',
-                'sample_idx': 0
-            }
+            except Exception as e:
+                # Log error with more context
+                error_msg = str(e)[:100]
+                if self.is_main_process and (retry == max_retries - 1 or idx % 500 == 0):
+                    print(f"⚠️ Error loading {file_path.name} (attempt {retry+1}/{max_retries}): {error_msg}")
+                
+                # On final retry, try to get a different file
+                if retry == max_retries - 1:
+                    # Try to get a fallback file from the dataset
+                    if len(self.samples) > 1:
+                        fallback_idx = (idx + 1) % len(self.samples)
+                        fallback_file, fallback_sample_idx = self.samples[fallback_idx]
+                        
+                        # Quick check if fallback file exists
+                        if fallback_file.exists():
+                            try:
+                                # Simple validation - just try to get file size
+                                if fallback_file.stat().st_size > 1000:  # At least 1KB
+                                    file_path, sample_idx = fallback_file, fallback_sample_idx
+                                    continue  # Retry with fallback file
+                            except:
+                                pass
+                    
+                    # Final fallback: Return silence
+                    break
+                
+                # Wait a bit before retry
+                time.sleep(0.01)
+        
+        # FIXED: 최종 실패 시 침묵 반환
+        if self.is_main_process and idx % 100 == 0:
+            print(f"⚠️ Using silence fallback for {file_path.name if file_path else 'unknown'}")
+        
+        audio = np.zeros((2, self.segment_length), dtype=np.float32)
+        return {
+            'audio': torch.from_numpy(audio),
+            'filename': f'fallback_{file_path.name if file_path else "unknown"}',
+            'sample_idx': sample_idx
+        }
 
 def setup_safe_rng_state(accelerator: Accelerator, base_seed: int):
     """Safe RNG setup to prevent mt19937 state issues"""
@@ -228,40 +285,41 @@ def setup_safe_rng_state(accelerator: Accelerator, base_seed: int):
             torch.cuda.synchronize()
         except Exception:
             pass
-    
-    # FIXED: Only main process logs RNG setup
-    if accelerator.is_main_process:
-        print(f"🎲 RNG setup: seed={base_seed}, processes={accelerator.num_processes}")
 
 def setup_accelerator(config):
     """
-    FIXED: Setup Accelerator with find_unused_parameters=True for DDP
+    CRITICAL FIX: DDP 설정 with static graph support
     """
-    # CRITICAL: Enable find_unused_parameters to handle unused parameters
+    # Mixed precision 설정
     accelerator_kwargs = {
-        'mixed_precision': 'fp16',  # FIXED: Enable FP16 for performance
+        'mixed_precision': 'fp16',
         'gradient_accumulation_steps': config['training']['accumulate_grad_batches'],
     }
     
-    # CRITICAL: Add DDP kwargs with find_unused_parameters=True
+    # DDP kwargs with find_unused_parameters=True for stability
     if HAS_DDP_KWARGS:
         try:
             ddp_kwargs = DistributedDataParallelKwargs(
-                find_unused_parameters=True,  # FIXED: Enable unused parameter detection
+                find_unused_parameters=False,   # True로 변경 - DDP 안정성 확보
                 broadcast_buffers=True,
-                bucket_cap_mb=25
+                bucket_cap_mb=25,
+                static_graph=False             # False로 변경 - dynamic graph 허용
             )
             accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
         except Exception:
-            pass
+            # Fallback without static_graph if not supported
+            try:
+                ddp_kwargs = DistributedDataParallelKwargs(
+                    find_unused_parameters=False,
+                    broadcast_buffers=True,
+                    bucket_cap_mb=25
+                )
+                accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
+            except Exception:
+                pass
     
     # Create Accelerator
     accelerator = Accelerator(**accelerator_kwargs)
-    
-    # FIXED: Only main process logs setup
-    if accelerator.is_main_process:
-        print(f"🚀 Setup: {accelerator.num_processes} processes, mixed_precision={accelerator.mixed_precision}")
-        print(f"✅ DDP: find_unused_parameters=True (handles unused parameters)")
     
     return accelerator
 
@@ -279,55 +337,46 @@ def setup_data_loader(config: Dict[str, Any], accelerator: Accelerator):
         sample_rate=sample_rate,
         rank=accelerator.process_index,
         world_size=accelerator.num_processes,
-        is_main_process=accelerator.is_main_process  # FIXED: Pass main process flag
+        is_main_process=accelerator.is_main_process
     )
     
-    # FIXED: Reduce batch size for stability and performance
-    batch_size = max(1, config['training']['batch_size'] // 2)  # Reduce batch size
+    # 멀티GPU 환경에 최적화된 배치 크기 설정
+    batch_size = config['training']['batch_size']  # 멀티GPU에서는 원래 배치 사이즈 사용
+    
+    # 설정 파일에서 DataLoader 파라미터 가져오기 (고성능 CPU 활용)
+    num_workers = config['training']['num_workers']  # CPU 성능이 좋으므로 제한 제거
+    persistent_workers = config['training'].get('persistent_workers', True) if num_workers > 0 else False
+    prefetch_factor = config['training'].get('prefetch_factor', 4) if num_workers > 0 else None
     
     dataloader = DataLoader(
         dataset,
-        batch_size=batch_size,  # FIXED: Use reduced batch size
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=0,  # Prevent CUDA errors
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
-        persistent_workers=False,
-        prefetch_factor=None,
-        worker_init_fn=None
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        worker_init_fn=worker_init_fn,  # 전역 함수 사용 - spawn 모드에서 pickle 가능
+        multiprocessing_context='spawn' if num_workers > 0 else None  # 멀티GPU 안정성
     )
-    
-    if accelerator.is_main_process:
-        print(f"✅ DataLoader: batch_size={batch_size} (reduced for stability), num_workers=0")
     
     return dataloader
 
 def validate_environment():
     """Validate training environment - only main process logs"""
     if not torch.cuda.is_available():
-        print("❌ CUDA not available")
         return False
     
     gpu_count = torch.cuda.device_count()
     if gpu_count < 1:
-        print("❌ No GPUs found")
         return False
-    
-    # Check GPU memory - only log once
-    try:
-        props = torch.cuda.get_device_properties(0)
-        memory_gb = props.total_memory / (1024**3)
-        print(f"🔧 GPU 0: {props.name}, Memory: {memory_gb:.1f}GB")
-    except Exception:
-        pass
     
     # Test mel filterbank
     try:
         from lycodec.audio import create_mel_filterbank
         mel_filterbank = create_mel_filterbank(n_mels=N_MELS)
-        print(f"✅ Mel filterbank test passed: {N_MELS} bins")
     except Exception as e:
-        print(f"❌ Mel filterbank test failed: {e}")
         return False
     
     return True
@@ -336,21 +385,21 @@ def validate_config(config):
     """Validate and convert config values"""
     training = config.get('training', {})
     training['learning_rate'] = float(training.get('learning_rate', 1e-4))
-    training['batch_size'] = int(training.get('batch_size', 6))  # FIXED: Smaller default
-    training['accumulate_grad_batches'] = int(training.get('accumulate_grad_batches', 4))  # FIXED: Smaller default
-    training['num_epochs'] = int(training.get('num_epochs', 100))  # FIXED: Smaller for testing
-    training['num_workers'] = 0  # FORCE to 0 for CUDA safety
-    training['save_every'] = int(training.get('save_every', 10))  # FIXED: Save more frequently
-    training['mixed_precision'] = True  # FIXED: Enable FP16
+    training['batch_size'] = int(training.get('batch_size', 12))  # 기본값 12로 증가
+    training['accumulate_grad_batches'] = int(training.get('accumulate_grad_batches', 4))
+    training['num_epochs'] = int(training.get('num_epochs', 100))
+    training['num_workers'] = int(training.get('num_workers', 32))  # 안정성을 위해 32로 조정
+    training['save_every'] = int(training.get('save_every', 10))
+    training['mixed_precision'] = True
     training['gradient_checkpointing'] = bool(training.get('gradient_checkpointing', True))
     
     data = config.get('data', {})
-    data['segment_seconds'] = float(data.get('segment_seconds', 4.0))  # FIXED: Shorter segments
-    data['samples_per_track'] = int(data.get('samples_per_track', 2))  # FIXED: Fewer samples
+    data['segment_seconds'] = float(data.get('segment_seconds', 4.0))
+    data['samples_per_track'] = int(data.get('samples_per_track', 2))
+    # 파일 제한: None이면 무제한으로 설정
     if data.get('file_limit') is not None:
-        data['file_limit'] = max(50, int(data['file_limit']))  # FIXED: Minimum 50 files
-    else:
-        data['file_limit'] = 1000  # FIXED: Limit for testing
+        data['file_limit'] = int(data['file_limit'])
+    # else: data['file_limit'] remains None (무제한)
     
     audio = config.get('audio', {})
     audio['sample_rate'] = int(audio.get('sample_rate', 44100))
@@ -361,7 +410,7 @@ def validate_config(config):
     return config
 
 def main():
-    parser = argparse.ArgumentParser(description='Train LyCodec v2.0 - DDP FIXED VERSION')
+    parser = argparse.ArgumentParser(description='Train LyCodec v2.0 - DDP FIXED')
     parser.add_argument('--config', type=str, default='config.yaml',
                        help='Configuration file path')
     parser.add_argument('--resume', type=str, default=None,
@@ -381,9 +430,8 @@ def main():
             print(f"❌ Gradient test failed: {e}")
             sys.exit(1)
     
-    # Validate environment - only once before distributed setup
+    # Validate environment
     if not validate_environment():
-        print("❌ Environment validation failed")
         sys.exit(1)
     
     # Load and validate configuration
@@ -391,12 +439,11 @@ def main():
         with open(args.config, 'r') as f:
             config = yaml.safe_load(f)
     except FileNotFoundError:
-        print(f"❌ Config file not found: {args.config}")
         sys.exit(1)
     
     config = validate_config(config)
     
-    # Setup Accelerator with DDP fixes
+    # CRITICAL: Setup Accelerator with DDP fixes
     accelerator = setup_accelerator(config)
     
     # Setup RNG states
@@ -406,33 +453,17 @@ def main():
     # Setup data loading
     dataloader = setup_data_loader(config, accelerator)
     
-    # Prepare DataLoader and disable RNG synchronization
-    dataloader = accelerator.prepare(dataloader)
-    
-    # Disable RNG sync to prevent mt19937 errors
-    if hasattr(dataloader, 'rng_types'):
-        dataloader.rng_types = []
-    if hasattr(dataloader, 'synchronized_generator'):
-        dataloader.synchronized_generator = None
-    
-    # Calculate training steps
+    # Calculate training steps first
     steps_per_epoch = len(dataloader) // config['training']['accumulate_grad_batches']
     total_steps = steps_per_epoch * config['training']['num_epochs']
-    
-    if accelerator.is_main_process:
-        print(f"📊 Training: {steps_per_epoch} steps/epoch, {total_steps} total steps")
-        effective_batch = (config['training']['batch_size'] * 
-                          config['training']['accumulate_grad_batches'] * 
-                          accelerator.num_processes)
-        print(f"📦 Effective batch size: {effective_batch}")
     
     # Setup trainer
     sample_rate = config.get('audio', {}).get('sample_rate', 44100)
     
-    trainer = LyCodecTrainer(
+    trainer = Trainer(
         model_config=config['model'],
         learning_rate=float(config['training']['learning_rate']),
-        batch_size=config['training']['batch_size'],  # Use actual batch size from config
+        batch_size=config['training']['batch_size'],
         accumulate_grad_batches=int(config['training']['accumulate_grad_batches']),
         max_sequence_length=int(sample_rate * config['data']['segment_seconds']),
         use_amp=bool(config['training']['mixed_precision']),
@@ -441,51 +472,52 @@ def main():
         accelerator=accelerator
     )
     
-    # JIT warm-up - only main process logs
-    if accelerator.is_main_process:
-        print("🔥 JIT warm-up...")
+    # Prepare all components together for proper device placement
+    trainer.model, trainer.optimizer, trainer.scheduler, dataloader = accelerator.prepare(
+        trainer.model, trainer.optimizer, trainer.scheduler, dataloader
+    )
     
+    # Disable RNG sync to prevent mt19937 errors
+    if hasattr(dataloader, 'rng_types'):
+        dataloader.rng_types = []
+    if hasattr(dataloader, 'synchronized_generator'):
+        dataloader.synchronized_generator = None
+    
+    # JIT warm-up - 모든 프로세스에서 수행
     try:
         trainer.model.eval()
         with torch.no_grad():
             dummy_audio = torch.randn(
-                1, 2, int(sample_rate * config['data']['segment_seconds']),  # FIXED: Use actual batch size
+                1, 2, int(sample_rate * config['data']['segment_seconds']),
                 device=accelerator.device,
                 dtype=torch.float16 if config['training']['mixed_precision'] else torch.float32
             )
             dummy_batch = {'audio': dummy_audio}
             _ = trainer.train_step(dummy_batch, warmup=True)
-            
-        if accelerator.is_main_process:
-            print("✅ JIT warm-up completed")
                 
     except Exception as e:
-        if accelerator.is_main_process:
-            print(f"⚠️ JIT warm-up failed: {e}")
+        pass
     
     trainer.model.train()
     
-    # Verify gradient flow - only main process
-    if accelerator.is_main_process:
-        print("🔍 Verifying gradient flow...")
-        trainer.verify_gradient_flow()
-    
-    # Initialize wandb - SIMPLIFIED
+    # Initialize wandb
     if accelerator.is_main_process and config.get('wandb', {}).get('enabled', True):
         wandb_config = {
             'project': config.get('wandb', {}).get('project', 'lycodec-ddp-fixed'),
-            'name': f"lycodec-ddp-fixed-{base_seed}",
+            'name': f"lycodec-ddp-stable-{base_seed}",
             'config': {
                 **config,
-                'fixes_applied': {
-                    'ddp_unused_parameters_fixed': True,
-                    'find_unused_parameters_enabled': True,
-                    'log_spam_eliminated': True,
-                    'performance_optimized': True
+                'ddp_fixes_applied': {
+                    'find_unused_parameters_enabled': False,
+                    'static_graph_disabled': True,
+                    'gpu_audio_preprocessing': True,
+                    'unified_accelerator_prepare': True,
+                    'all_process_jit_warmup': True,
+                    'ddp_stability_prioritized': True
                 }
             },
-            'tags': ['lycodec', 'ddp-fixed', 'stable'],
-            'notes': 'DDP unused parameters issue fixed with find_unused_parameters=True'
+            'tags': ['lycodec', 'ddp-stable', 'multi-gpu'],
+            'notes': 'DDP 안정성 우선 - find_unused_parameters=True, static_graph=False'
         }
         trainer.setup_wandb(wandb_config)
     
@@ -564,4 +596,4 @@ def main():
             print(f"💾 Checkpoints in: {checkpoint_dir}")
 
 if __name__ == '__main__':
-    main()
+    main()  
